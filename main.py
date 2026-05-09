@@ -401,7 +401,23 @@ class ActiveFunctionPlugin(Star):
         session_key = event.unified_msg_origin
         segments = self._reply_mgr.parse_segments(full_text, session_key)
 
-        if not segments:
+        # Check if all segments have empty text (e.g. all content was converted to
+        # Record/voice by TTS plugin, or reply tag points to nothing).
+        # QQ does not support reply + voice, so we strip reply tags and let the
+        # non-plain components send normally via the framework.
+        has_text_content = segments and any(seg.text.strip() for seg in segments)
+        if not has_text_content:
+            logger.info(
+                "[ActiveFunction] Reply segments have no text content, "
+                "stripping reply tags to avoid QQ incompatibility"
+            )
+            # Rebuild chain: strip reply tags from Plain text, keep non-Plain components
+            stripped_text = re.sub(r"\[reply:\d+\]", "", full_text).strip()
+            new_chain = []
+            if stripped_text:
+                new_chain.append(Plain(stripped_text))
+            new_chain.extend(non_plain_components)
+            result.chain = new_chain
             return
 
         # Send all segments, passing non-plain components for proper handling
