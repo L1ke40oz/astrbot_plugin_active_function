@@ -3,9 +3,10 @@ import re
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import Plain
+from astrbot.api.message_components import Plain, Record
 from astrbot.api.star import Context, Star, register
 from astrbot.core.config.astrbot_config import AstrBotConfig
+from astrbot.core.message.components import BaseMessageComponent
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
 )
@@ -267,12 +268,11 @@ class ActiveFunctionPlugin(Star):
         the poke action. The cleaned text continues to flow through reply/recall
         handlers and normal segment splitting.
 
+        When poke is disabled, tags are still stripped to prevent leaking to users.
+
         Compatible with both normal messages (AiocqhttpMessageEvent with event.bot)
         and proactive messages (generic AstrMessageEvent, bot fetched from platform).
         """
-        if not self.poke_enable:
-            return
-
         # Check platform is aiocqhttp (works for both normal and proactive events)
         platform_name = getattr(event.platform_meta, "name", "")
         if platform_name != "aiocqhttp":
@@ -295,12 +295,17 @@ class ActiveFunctionPlugin(Star):
         if not self._poke_mgr.has_poke_tag(full_text):
             return
 
-        logger.info("[ActiveFunction] on_decorating_result: handling poke tag")
-
-        # Strip [poke] tag from the text in the result chain
+        # Always strip [poke] tags from text to prevent leaking to users
         for i, comp in enumerate(result.chain):
             if isinstance(comp, Plain) and self.poke_tag in comp.text:
                 result.chain[i] = Plain(comp.text.replace(self.poke_tag, ""))
+
+        # If poke is disabled, just strip the tag and return
+        if not self.poke_enable:
+            logger.debug("[ActiveFunction] Poke disabled, stripped tag from output")
+            return
+
+        logger.info("[ActiveFunction] on_decorating_result: handling poke tag")
 
         # Get bot instance: try event.bot first, then fall back to platform instance
         bot = getattr(event, "bot", None)
@@ -345,9 +350,12 @@ class ActiveFunctionPlugin(Star):
         If reply tags are found, this handler takes over sending entirely.
         If no reply tags but recall tags exist, this handler does nothing and
         lets the recall handler process it.
+
+        When reply is disabled, tags are still stripped to prevent leaking to users.
+
+        This handler also preserves non-Plain components (e.g. Record from TTS plugin)
+        and sends them alongside the text segments.
         """
-        if not self.reply_enable:
-            return
         if not isinstance(event, AiocqhttpMessageEvent):
             return
         if event.get_group_id():
@@ -366,7 +374,28 @@ class ActiveFunctionPlugin(Star):
         if not self._reply_mgr.has_reply_tags(full_text):
             return
 
+        # If reply is disabled, just strip the tags and let normal sending proceed
+        if not self.reply_enable:
+            logger.debug("[ActiveFunction] Reply disabled, stripping reply tags from output")
+            stripped_text = re.sub(r"\[reply:\d+\]", "", full_text)
+            # Rebuild chain with stripped text
+            new_chain = []
+            text_replaced = False
+            for comp in result.chain:
+                if isinstance(comp, Plain) and not text_replaced:
+                    new_chain.append(Plain(stripped_text))
+                    text_replaced = True
+                elif not isinstance(comp, Plain):
+                    new_chain.append(comp)
+            result.chain = new_chain
+            return
+
         logger.info("[ActiveFunction] on_decorating_result: handling reply tags")
+
+        # Collect non-Plain components (e.g. Record from TTS) in order
+        non_plain_components: list[BaseMessageComponent] = [
+            comp for comp in result.chain if not isinstance(comp, Plain)
+        ]
 
         # Parse into segments (handles both reply and recall tags)
         session_key = event.unified_msg_origin
@@ -375,8 +404,8 @@ class ActiveFunctionPlugin(Star):
         if not segments:
             return
 
-        # Send all segments
-        await self._send_reply_segments(event, segments)
+        # Send all segments, passing non-plain components for proper handling
+        await self._send_reply_segments(event, segments, non_plain_components)
 
         # Prevent the framework from sending anything
         event.clear_result()
@@ -385,9 +414,16 @@ class ActiveFunctionPlugin(Star):
         event.set_extra("_recall_handled", True)
 
     async def _send_reply_segments(
-        self, event: AiocqhttpMessageEvent, segments: list
+        self,
+        event: AiocqhttpMessageEvent,
+        segments: list,
+        non_plain_components: list[BaseMessageComponent] | None = None,
     ) -> None:
-        """Send parsed reply segments with Reply components and recall scheduling."""
+        """Send parsed reply segments with Reply components and recall scheduling.
+
+        Also handles non-Plain components (e.g. Record from TTS plugin) by sending
+        them after all text segments have been sent.
+        """
         bot = event.bot
         uid = event.get_sender_id()
 
@@ -428,6 +464,47 @@ class ActiveFunctionPlugin(Star):
             # Interval between segments
             if i < len(segments) - 1:
                 await asyncio.sleep(self.segment_interval)
+
+        # Send non-Plain components (e.g. Record/voice from TTS plugin)
+        if non_plain_components:
+            for comp in non_plain_components:
+                if isinstance(comp, Record):
+                    await self._send_record_component(bot, int(uid), comp)
+                    await asyncio.sleep(self.segment_interval)
+                else:
+                    # For other component types, try generic dict conversion
+                    try:
+                        msg_dict = comp.toDict()
+                        await bot.send_private_msg(
+                            user_id=int(uid), message=[msg_dict]
+                        )
+                        await asyncio.sleep(self.segment_interval)
+                    except Exception as e:
+                        logger.debug(
+                            f"[ActiveFunction] Skipped non-Plain component: {e}"
+                        )
+
+    async def _send_record_component(
+        self, bot, user_id: int, record: Record
+    ) -> None:
+        """Send a Record (voice) component via OneBot API."""
+        try:
+            # Convert Record to base64 format for sending (same as aiocqhttp platform)
+            bs64 = await record.convert_to_base64()
+            message = [{"type": "record", "data": {"file": f"base64://{bs64}"}}]
+            await bot.send_private_msg(user_id=user_id, message=message)
+            logger.info(f"[ActiveFunction] Sent voice message to user {user_id}")
+        except Exception as e:
+            logger.error(f"[ActiveFunction] Failed to send voice: {e}")
+            # Fallback: send the text content if available
+            if record.text:
+                try:
+                    await bot.send_private_msg(
+                        user_id=user_id,
+                        message=[{"type": "text", "data": {"text": record.text}}],
+                    )
+                except Exception:
+                    pass
 
     # ==================== Prompt Injection ====================
 
@@ -472,11 +549,10 @@ class ActiveFunctionPlugin(Star):
     async def handle_recall_decorate(self, event: AstrMessageEvent):
         """For non-streaming mode: intercept before send, handle recall logic.
 
+        When recall is disabled, tags are still stripped to prevent leaking to users.
+
         This hook may NOT fire in streaming mode.
         """
-        if not self.recall_enable:
-            return
-
         result = event.get_result()
         if not result or not result.chain:
             return
@@ -493,6 +569,22 @@ class ActiveFunctionPlugin(Star):
                 full_text += comp.text
 
         if self.recall_tag not in full_text:
+            return
+
+        # If recall is disabled, just strip the tags and let normal sending proceed
+        if not self.recall_enable:
+            logger.debug("[ActiveFunction] Recall disabled, stripping recall tags from output")
+            stripped_text = full_text.replace(self.recall_tag, "")
+            # Rebuild chain with stripped text
+            new_chain = []
+            text_replaced = False
+            for comp in result.chain:
+                if isinstance(comp, Plain) and not text_replaced:
+                    new_chain.append(Plain(stripped_text))
+                    text_replaced = True
+                elif not isinstance(comp, Plain):
+                    new_chain.append(comp)
+            result.chain = new_chain
             return
 
         logger.info(
