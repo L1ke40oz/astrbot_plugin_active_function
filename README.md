@@ -1,14 +1,113 @@
-# astrbot-plugin-helloworld
+# astrbot_plugin_active_function
 
-AstrBot 插件模板 / A template plugin for AstrBot plugin feature
+为 AstrBot 提供主动能力的插件：消息撤回、引用回复、戳一戳。
 
-> [!NOTE]
-> This repo is just a template of [AstrBot](https://github.com/AstrBotDevs/AstrBot) Plugin.
-> 
-> [AstrBot](https://github.com/AstrBotDevs/AstrBot) is an agentic assistant for both personal and group conversations. It can be deployed across dozens of mainstream instant messaging platforms, including QQ, Telegram, Feishu, DingTalk, Slack, LINE, Discord, Matrix, etc. In addition, it provides a reliable and extensible conversational AI infrastructure for individuals, developers, and teams. Whether you need a personal AI companion, an intelligent customer support agent, an automation assistant, or an enterprise knowledge base, AstrBot enables you to quickly build AI applications directly within your existing messaging workflows.
+当前仅支持 aiocqhttp（OneBot v11）平台私聊。
 
-# Supports
+## 功能概览
 
-- [AstrBot Repo](https://github.com/AstrBotDevs/AstrBot)
-- [AstrBot Plugin Development Docs (Chinese)](https://docs.astrbot.app/dev/star/plugin-new.html)
-- [AstrBot Plugin Development Docs (English)](https://docs.astrbot.app/en/dev/star/plugin-new.html)
+### 消息撤回
+
+Bot 可以在回复中使用 `[recall]` 标签，标记的那一段消息会在发送后自动撤回（默认 5 秒）。
+
+```
+正常的回复内容
+[recall]其实我觉得你很可爱
+后续正常内容
+```
+
+效果：第二段会短暂展示后自动撤回，其余内容正常保留。
+
+### 引用回复
+
+Bot 可以使用 `[reply:ID]` 标签引用用户之前发送的消息，系统会将其转换为 QQ 原生引用回复。
+
+```
+[reply:12345]这条消息说得对
+```
+
+- 系统会在消息防抖合并前缓存每条原始消息的 ID
+- LLM 的 system prompt 中会注入可引用的消息列表
+- 只有列表中存在的 ID 才能被引用
+
+### 戳一戳
+
+**接收戳一戳**：用户戳 Bot 时，会将戳一戳事件转换为文本注入到正常的 LLM 对话流程中（经过消息防抖合并），Bot 可以自然地回应。
+
+**发送戳一戳**：Bot 可以在回复中使用 `[poke]` 标签，系统会在消息发送前执行戳一戳动作。
+
+```
+在做什么 [poke]
+```
+
+
+## 配置说明
+
+安装后在 AstrBot 管理面板中配置。
+
+| 配置项 | 说明 |
+|--------|------|
+| **分段正则表达式** | 用于分割 Bot 回复为多条消息的正则（全局生效）。留空不启用分段。 |
+| **分段发送间隔** | 分段发送时每条消息之间的间隔时间（秒） |
+
+### 消息撤回配置
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| 启用撤回功能 | `true` | 总开关 |
+| 撤回延迟 | `5` 秒 | 消息发送后多久执行撤回 |
+| 撤回标签 | `[recall]` | LLM 回复中的撤回标记 |
+
+### 引用回复配置
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| 启用引用回复 | `true` | 总开关 |
+| 消息缓存有效期 | `600` 秒 | 超时后消息不再可被引用 |
+| 每会话最大缓存数 | `50` | 每个用户会话最多缓存多少条消息 |
+
+### 戳一戳配置
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| 启用戳一戳 | `true` | 总开关 |
+| 冷却时间 | `5` 秒 | 同一用户连续戳的最小间隔 |
+| 提示词模板 | 见下方 | 用户戳 Bot 时注入的提示词，`$username` 会被替换 |
+| 戳一戳标签 | `[poke]` | LLM 回复中的戳一戳标记 |
+
+### 提示词注入配置
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| 启用提示词注入 | `true` | 总开关 |
+| 撤回功能提示词 | 内置模板 | 告知 LLM 如何使用 `[recall]` |
+| 引用回复提示词 | 内置模板 | 告知 LLM 如何使用 `[reply:ID]` |
+| 戳一戳功能提示词 | 内置模板 | 告知 LLM 如何使用 `[poke]` |
+
+## 工作原理
+
+### 事件处理优先级
+
+```
+priority 100: 缓存用户消息（在防抖合并前）
+priority  90: 拦截戳一戳事件，注入文本
+priority  12: 处理 [poke] 标签（剥离 + 执行动作）
+priority  11: 处理 [reply:ID] 标签（接管发送）
+priority  10: 处理 [recall] 标签（接管发送 + 定时撤回）
+```
+
+### 与其他插件的兼容性
+
+- **消息防抖插件**：戳一戳事件注入的文本会正常参与防抖合并
+- **主动消息插件**（proactive_chat）：`[poke]` 标签可在主动消息中正常解析执行
+- **分段回复**：`[recall]` 和 `[reply:ID]` 均支持分段场景，每段独立判断是否撤回
+
+## 平台要求
+
+- AstrBot 框架
+- aiocqhttp（OneBot v11）适配器
+- 支持 `friend_poke` API 的 OneBot 实现（如 NapCat、LLOneBot）
+
+## License
+
+MIT
