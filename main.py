@@ -353,8 +353,9 @@ class ActiveFunctionPlugin(Star):
 
         When reply is disabled, tags are still stripped to prevent leaking to users.
 
-        This handler also preserves non-Plain components (e.g. Record from TTS plugin)
-        and sends them alongside the text segments.
+        This handler preserves the ordering of non-Plain components (e.g. Record
+        from TTS plugin) within the message chain, so that voice messages are sent
+        in their correct position relative to text segments rather than all at the end.
         """
         if not isinstance(event, AiocqhttpMessageEvent):
             return
@@ -365,7 +366,7 @@ class ActiveFunctionPlugin(Star):
         if not result or not result.chain:
             return
 
-        # Get plain text from chain
+        # Get plain text from chain (for tag detection only)
         full_text = ""
         for comp in result.chain:
             if isinstance(comp, Plain):
@@ -377,51 +378,53 @@ class ActiveFunctionPlugin(Star):
         # If reply is disabled, just strip the tags and let normal sending proceed
         if not self.reply_enable:
             logger.debug("[ActiveFunction] Reply disabled, stripping reply tags from output")
-            stripped_text = re.sub(r"\[reply:\d+\]", "", full_text)
-            # Rebuild chain with stripped text
-            new_chain = []
-            text_replaced = False
-            for comp in result.chain:
-                if isinstance(comp, Plain) and not text_replaced:
-                    new_chain.append(Plain(stripped_text))
-                    text_replaced = True
-                elif not isinstance(comp, Plain):
-                    new_chain.append(comp)
-            result.chain = new_chain
+            for i, comp in enumerate(result.chain):
+                if isinstance(comp, Plain):
+                    result.chain[i] = Plain(re.sub(r"\[reply:\d+\]", "", comp.text))
             return
 
         logger.info("[ActiveFunction] on_decorating_result: handling reply tags")
 
-        # Collect non-Plain components (e.g. Record from TTS) in order
-        non_plain_components: list[BaseMessageComponent] = [
-            comp for comp in result.chain if not isinstance(comp, Plain)
-        ]
+        # Build an ordered list of "chunks" preserving chain order.
+        # Each chunk is either a text string (from consecutive Plains) or a
+        # non-Plain component (e.g. Record from TTS plugin).
+        # This preserves the interleaving order so voice is sent in position.
+        ordered_chunks: list[str | BaseMessageComponent] = []
+        current_text = ""
+        for comp in result.chain:
+            if isinstance(comp, Plain):
+                current_text += comp.text
+            else:
+                if current_text:
+                    ordered_chunks.append(current_text)
+                    current_text = ""
+                ordered_chunks.append(comp)
+        if current_text:
+            ordered_chunks.append(current_text)
 
-        # Parse into segments (handles both reply and recall tags)
-        session_key = event.unified_msg_origin
-        segments = self._reply_mgr.parse_segments(full_text, session_key)
-
-        # Check if all segments have empty text (e.g. all content was converted to
-        # Record/voice by TTS plugin, or reply tag points to nothing).
-        # QQ does not support reply + voice, so we strip reply tags and let the
-        # non-plain components send normally via the framework.
-        has_text_content = segments and any(seg.text.strip() for seg in segments)
-        if not has_text_content:
+        # Check if all text content is empty (only non-Plain components remain)
+        all_text = "".join(c for c in ordered_chunks if isinstance(c, str))
+        stripped_all = re.sub(r"\[reply:\d+\]", "", all_text).strip()
+        if not stripped_all:
+            # No text content after stripping reply tags — let non-Plain send normally
             logger.info(
                 "[ActiveFunction] Reply segments have no text content, "
                 "stripping reply tags to avoid QQ incompatibility"
             )
-            # Rebuild chain: strip reply tags from Plain text, keep non-Plain components
-            stripped_text = re.sub(r"\[reply:\d+\]", "", full_text).strip()
             new_chain = []
-            if stripped_text:
-                new_chain.append(Plain(stripped_text))
-            new_chain.extend(non_plain_components)
+            for chunk in ordered_chunks:
+                if isinstance(chunk, str):
+                    cleaned = re.sub(r"\[reply:\d+\]", "", chunk).strip()
+                    if cleaned:
+                        new_chain.append(Plain(cleaned))
+                else:
+                    new_chain.append(chunk)
             result.chain = new_chain
             return
 
-        # Send all segments, passing non-plain components for proper handling
-        await self._send_reply_segments(event, segments, non_plain_components)
+        # Send all chunks in order, preserving interleaving of text and non-Plain
+        session_key = event.unified_msg_origin
+        await self._send_reply_segments_ordered(event, ordered_chunks, session_key)
 
         # Prevent the framework from sending anything
         event.clear_result()
@@ -429,76 +432,87 @@ class ActiveFunctionPlugin(Star):
         # Mark as handled so recall handler and after_message_sent don't double-process
         event.set_extra("_recall_handled", True)
 
-    async def _send_reply_segments(
+    async def _send_reply_segments_ordered(
         self,
         event: AiocqhttpMessageEvent,
-        segments: list,
-        non_plain_components: list[BaseMessageComponent] | None = None,
+        ordered_chunks: list,
+        session_key: str,
     ) -> None:
-        """Send parsed reply segments with Reply components and recall scheduling.
+        """Send chunks in order, preserving interleaving of text and non-Plain components.
 
-        Also handles non-Plain components (e.g. Record from TTS plugin) by sending
-        them after all text segments have been sent.
+        ordered_chunks is a list where each element is either:
+        - str: text that may contain [reply:ID] and [recall] tags
+        - BaseMessageComponent: a non-Plain component (e.g. Record from TTS)
+
+        Text chunks are parsed into ReplySegments (handling reply/recall tags).
+        Non-Plain components are sent in their original position in the chain.
         """
         bot = event.bot
         uid = event.get_sender_id()
+        sent_count = 0
 
-        for i, segment in enumerate(segments):
-            if not segment.text:
-                continue
+        for chunk in ordered_chunks:
+            if isinstance(chunk, str):
+                # Parse text chunk into reply segments
+                segments = self._reply_mgr.parse_segments(chunk, session_key)
+                for segment in segments:
+                    if not segment.text:
+                        continue
 
-            # Build message payload
-            message = []
-            if segment.reply_message_id is not None:
-                message.append(
-                    {"type": "reply", "data": {"id": str(segment.reply_message_id)}}
-                )
-            message.append({"type": "text", "data": {"text": segment.text}})
+                    # Interval between messages
+                    if sent_count > 0:
+                        await asyncio.sleep(self.segment_interval)
 
-            try:
-                send_result = await bot.send_private_msg(
-                    user_id=int(uid),
-                    message=message,
-                )
-            except Exception as e:
-                logger.error(f"[ActiveFunction] Failed to send reply segment: {e}")
-                continue
+                    # Build message payload
+                    message = []
+                    if segment.reply_message_id is not None:
+                        message.append(
+                            {"type": "reply", "data": {"id": str(segment.reply_message_id)}}
+                        )
+                    message.append({"type": "text", "data": {"text": segment.text}})
 
-            # Schedule recall if this segment also has a recall tag
-            if segment.should_recall and send_result:
-                message_id = send_result.get("message_id")
-                if message_id:
-                    task = asyncio.create_task(
-                        self._delayed_recall(bot, int(message_id))
-                    )
-                    task.add_done_callback(self._remove_task)
-                    self._recall_tasks.append(task)
-                    logger.info(
-                        f"[ActiveFunction] Reply+Recall scheduled: msg_id={message_id}"
-                    )
-
-            # Interval between segments
-            if i < len(segments) - 1:
-                await asyncio.sleep(self.segment_interval)
-
-        # Send non-Plain components (e.g. Record/voice from TTS plugin)
-        if non_plain_components:
-            for comp in non_plain_components:
-                if isinstance(comp, Record):
-                    await self._send_record_component(bot, int(uid), comp)
-                    await asyncio.sleep(self.segment_interval)
-                else:
-                    # For other component types, try generic dict conversion
                     try:
-                        msg_dict = comp.toDict()
+                        send_result = await bot.send_private_msg(
+                            user_id=int(uid),
+                            message=message,
+                        )
+                    except Exception as e:
+                        logger.error(f"[ActiveFunction] Failed to send reply segment: {e}")
+                        continue
+
+                    sent_count += 1
+
+                    # Schedule recall if needed
+                    if segment.should_recall and send_result:
+                        message_id = send_result.get("message_id")
+                        if message_id:
+                            task = asyncio.create_task(
+                                self._delayed_recall(bot, int(message_id))
+                            )
+                            task.add_done_callback(self._remove_task)
+                            self._recall_tasks.append(task)
+                            logger.info(
+                                f"[ActiveFunction] Reply+Recall scheduled: msg_id={message_id}"
+                            )
+            else:
+                # Non-Plain component (e.g. Record from TTS plugin)
+                if sent_count > 0:
+                    await asyncio.sleep(self.segment_interval)
+
+                if isinstance(chunk, Record):
+                    await self._send_record_component(bot, int(uid), chunk)
+                else:
+                    try:
+                        msg_dict = chunk.toDict()
                         await bot.send_private_msg(
                             user_id=int(uid), message=[msg_dict]
                         )
-                        await asyncio.sleep(self.segment_interval)
                     except Exception as e:
                         logger.debug(
                             f"[ActiveFunction] Skipped non-Plain component: {e}"
                         )
+
+                sent_count += 1
 
     async def _send_record_component(
         self, bot, user_id: int, record: Record

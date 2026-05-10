@@ -3,7 +3,7 @@
         "description": "分段正则表达式",
         "type": "string",
         "hint": "用于分割 Bot 回复为多条消息的正则表达式（全局生效，撤回和引用回复均使用此规则）。与 AstrBot 分段正则表达式填写方式一致。留空则不启用分段。示例：[^\\n$\\\\]+ 表示按换行、$、\\\\ 分段",
-        "default": ""
+        "default": "[^$\\]+"
     },
     "segment_interval": {
         "description": "分段发送间隔（秒）",
