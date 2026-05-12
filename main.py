@@ -7,6 +7,7 @@ from astrbot.api.message_components import Plain, Record
 from astrbot.api.star import Context, Star, register
 from astrbot.core.config.astrbot_config import AstrBotConfig
 from astrbot.core.message.components import BaseMessageComponent
+from astrbot.core.message.message_event_result import ResultContentType
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
 )
@@ -286,19 +287,38 @@ class ActiveFunctionPlugin(Star):
         if not result or not result.chain:
             return
 
-        # Get plain text from chain
-        full_text = ""
-        for comp in result.chain:
-            if isinstance(comp, Plain):
-                full_text += comp.text
+        # Use original text from on_llm_response if available (tags were stripped for history)
+        original_text = event.get_extra("_active_func_original_text")
+        if original_text and self.poke_tag in original_text:
+            has_poke = True
+        else:
+            # Fallback: get plain text from chain
+            full_text = ""
+            for comp in result.chain:
+                if isinstance(comp, Plain):
+                    full_text += comp.text
+            has_poke = self._poke_mgr.has_poke_tag(full_text)
 
-        if not self._poke_mgr.has_poke_tag(full_text):
+        if not has_poke:
             return
 
         # Always strip [poke] tags from text to prevent leaking to users
         for i, comp in enumerate(result.chain):
             if isinstance(comp, Plain) and self.poke_tag in comp.text:
                 result.chain[i] = Plain(comp.text.replace(self.poke_tag, ""))
+
+        # In streaming mode, the message was already sent with [poke] in it.
+        # We need to recall it and re-send without the tag.
+        is_streaming = (
+            result.result_content_type == ResultContentType.STREAMING_FINISH
+            if hasattr(result, "result_content_type")
+            else False
+        )
+        if is_streaming and isinstance(event, AiocqhttpMessageEvent):
+            # Schedule recall of the streamed message and re-send without [poke]
+            await self._fix_streaming_poke(event, original_text or "")
+            # Mark as handled so reply/recall handlers don't double-process
+            event.set_extra("_recall_handled", True)
 
         # If poke is disabled, just strip the tag and return
         if not self.poke_enable:
@@ -340,6 +360,87 @@ class ActiveFunctionPlugin(Star):
         except Exception:
             return None
 
+    async def _fix_streaming_poke(
+        self, event: AiocqhttpMessageEvent, original_text: str
+    ):
+        """Fix [poke] tag leaking in streaming mode.
+
+        In streaming mode, the message was already sent with [poke] in it
+        (because streaming chunks are buffered and sent before on_decorating_result fires).
+        We recall the sent message and re-send it without the [poke] tag.
+        """
+        try:
+            bot = getattr(event, "bot", None)
+            if bot is None:
+                bot = self._get_bot_from_platform(event)
+            if bot is None:
+                return
+
+            uid = int(event.get_sender_id())
+            bot_id = event.get_self_id() or ""
+
+            # Get recent messages to find the one we just sent
+            try:
+                result = await bot.call_action(
+                    "get_friend_msg_history",
+                    user_id=uid,
+                    count=5,
+                )
+                messages = result.get("messages", []) if result else []
+            except Exception:
+                # API not available on this OneBot implementation
+                logger.debug(
+                    "[ActiveFunction] get_friend_msg_history not available, "
+                    "cannot fix streaming poke tag"
+                )
+                return
+
+            if not messages:
+                return
+
+            # Find the last message from the bot that contains [poke]
+            target_msg_id = None
+            for msg in reversed(messages):
+                sender_id = str(msg.get("sender", {}).get("user_id", ""))
+                if sender_id == bot_id:
+                    # Check if this message contains [poke]
+                    msg_content = ""
+                    raw_msg = msg.get("message", [])
+                    if isinstance(raw_msg, list):
+                        for seg in raw_msg:
+                            if isinstance(seg, dict) and seg.get("type") == "text":
+                                msg_content += seg.get("data", {}).get("text", "")
+                    elif isinstance(raw_msg, str):
+                        msg_content = raw_msg
+
+                    if self.poke_tag in msg_content:
+                        target_msg_id = msg.get("message_id")
+                        break
+
+            if not target_msg_id:
+                return
+
+            # Recall the message with [poke] tag
+            await bot.delete_msg(message_id=int(target_msg_id))
+
+            # Re-send without [poke] (also strip [recall] and [reply:ID] if present)
+            clean_text = original_text.replace(self.poke_tag, "")
+            clean_text = clean_text.replace(self.recall_tag, "")
+            clean_text = re.sub(r"\[reply:\d+\]", "", clean_text)
+            clean_text = re.sub(r"  +", " ", clean_text).strip()
+
+            if clean_text:
+                await bot.send_private_msg(
+                    user_id=uid,
+                    message=[{"type": "text", "data": {"text": clean_text}}],
+                )
+
+            logger.info(
+                "[ActiveFunction] Fixed streaming poke: recalled and re-sent without tag"
+            )
+        except Exception as e:
+            logger.debug(f"[ActiveFunction] Failed to fix streaming poke: {e}")
+
     # ==================== Reply: on_decorating_result ====================
 
     @filter.on_decorating_result(priority=11)
@@ -361,23 +462,33 @@ class ActiveFunctionPlugin(Star):
             return
         if event.get_group_id():
             return
+        # Skip if already handled by streaming poke fix
+        if event.get_extra("_recall_handled"):
+            return
 
         result = event.get_result()
         if not result or not result.chain:
             return
 
-        # Get plain text from chain (for tag detection only)
-        full_text = ""
-        for comp in result.chain:
-            if isinstance(comp, Plain):
-                full_text += comp.text
+        # Use original text from on_llm_response if available (tags were stripped for history)
+        original_text = event.get_extra("_active_func_original_text")
+        if original_text and re.search(r"\[reply:\d+\]", original_text):
+            full_text = original_text
+        else:
+            # Fallback: get plain text from chain (for tag detection only)
+            full_text = ""
+            for comp in result.chain:
+                if isinstance(comp, Plain):
+                    full_text += comp.text
 
         if not self._reply_mgr.has_reply_tags(full_text):
             return
 
         # If reply is disabled, just strip the tags and let normal sending proceed
         if not self.reply_enable:
-            logger.debug("[ActiveFunction] Reply disabled, stripping reply tags from output")
+            logger.debug(
+                "[ActiveFunction] Reply disabled, stripping reply tags from output"
+            )
             for i, comp in enumerate(result.chain):
                 if isinstance(comp, Plain):
                     result.chain[i] = Plain(re.sub(r"\[reply:\d+\]", "", comp.text))
@@ -389,18 +500,34 @@ class ActiveFunctionPlugin(Star):
         # Each chunk is either a text string (from consecutive Plains) or a
         # non-Plain component (e.g. Record from TTS plugin).
         # This preserves the interleaving order so voice is sent in position.
+        #
+        # When original_text is available (tags were stripped for history saving),
+        # we use it as the text source instead of the chain's cleaned text.
+        # We must strip [poke] from it since the poke handler already executed the action.
         ordered_chunks: list[str | BaseMessageComponent] = []
-        current_text = ""
-        for comp in result.chain:
-            if isinstance(comp, Plain):
-                current_text += comp.text
-            else:
-                if current_text:
-                    ordered_chunks.append(current_text)
-                    current_text = ""
+        if original_text and re.search(r"\[reply:\d+\]", original_text):
+            # Use original text with reply tags; strip [poke] since it's already handled
+            text_for_reply = original_text.replace(self.poke_tag, "")
+            # Use original text with tags; preserve non-Plain components from chain
+            non_plain_components = [
+                comp for comp in result.chain if not isinstance(comp, Plain)
+            ]
+            # Insert text as the first chunk, then non-Plain components
+            ordered_chunks.append(text_for_reply)
+            for comp in non_plain_components:
                 ordered_chunks.append(comp)
-        if current_text:
-            ordered_chunks.append(current_text)
+        else:
+            current_text = ""
+            for comp in result.chain:
+                if isinstance(comp, Plain):
+                    current_text += comp.text
+                else:
+                    if current_text:
+                        ordered_chunks.append(current_text)
+                        current_text = ""
+                    ordered_chunks.append(comp)
+            if current_text:
+                ordered_chunks.append(current_text)
 
         # Check if all text content is empty (only non-Plain components remain)
         all_text = "".join(c for c in ordered_chunks if isinstance(c, str))
@@ -467,7 +594,10 @@ class ActiveFunctionPlugin(Star):
                     message = []
                     if segment.reply_message_id is not None:
                         message.append(
-                            {"type": "reply", "data": {"id": str(segment.reply_message_id)}}
+                            {
+                                "type": "reply",
+                                "data": {"id": str(segment.reply_message_id)},
+                            }
                         )
                     message.append({"type": "text", "data": {"text": segment.text}})
 
@@ -477,7 +607,9 @@ class ActiveFunctionPlugin(Star):
                             message=message,
                         )
                     except Exception as e:
-                        logger.error(f"[ActiveFunction] Failed to send reply segment: {e}")
+                        logger.error(
+                            f"[ActiveFunction] Failed to send reply segment: {e}"
+                        )
                         continue
 
                     sent_count += 1
@@ -504,9 +636,7 @@ class ActiveFunctionPlugin(Star):
                 else:
                     try:
                         msg_dict = chunk.toDict()
-                        await bot.send_private_msg(
-                            user_id=int(uid), message=[msg_dict]
-                        )
+                        await bot.send_private_msg(user_id=int(uid), message=[msg_dict])
                     except Exception as e:
                         logger.debug(
                             f"[ActiveFunction] Skipped non-Plain component: {e}"
@@ -514,9 +644,7 @@ class ActiveFunctionPlugin(Star):
 
                 sent_count += 1
 
-    async def _send_record_component(
-        self, bot, user_id: int, record: Record
-    ) -> None:
+    async def _send_record_component(self, bot, user_id: int, record: Record) -> None:
         """Send a Record (voice) component via OneBot API."""
         try:
             # Convert Record to base64 format for sending (same as aiocqhttp platform)
@@ -540,38 +668,178 @@ class ActiveFunctionPlugin(Star):
 
     @filter.on_llm_request()
     async def inject_prompt(self, event: AstrMessageEvent, request: ProviderRequest):
-        """Inject function usage instructions into the LLM system prompt."""
+        """Inject function usage instructions into the LLM system prompt.
+
+        Also strips any control tags that may have leaked into conversation history
+        (from before the on_llm_response fix, or from streaming mode fallback).
+        This prevents the LLM from seeing stale tags in its context and producing
+        unexpected segmentation or behavior.
+        """
         if not self.prompt_enable:
             return
         suffix = self._build_system_prompt_suffix(event)
         if suffix:
             request.system_prompt += "\n\n" + suffix
 
+        # Clean control tags from conversation history contexts
+        self._clean_history_tags(request)
+
+    def _clean_history_tags(self, request: ProviderRequest):
+        """Strip control tags from assistant messages in conversation history.
+
+        This ensures the LLM never sees [recall], [poke], or [reply:ID] tags
+        in its context, even if they were saved to history before the fix.
+        """
+        if not request.contexts:
+            return
+
+        tag_pattern = re.compile(
+            re.escape(self.recall_tag)
+            + r"|"
+            + re.escape(self.poke_tag)
+            + r"|\[reply:\d+\]"
+        )
+
+        for ctx in request.contexts:
+            if not isinstance(ctx, dict):
+                continue
+            if ctx.get("role") != "assistant":
+                continue
+
+            content = ctx.get("content")
+            if isinstance(content, str):
+                if tag_pattern.search(content):
+                    ctx["content"] = tag_pattern.sub("", content).strip()
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text = part.get("text", "")
+                        if tag_pattern.search(text):
+                            part["text"] = tag_pattern.sub("", text).strip()
+
     # ==================== LLM Response Hook ====================
 
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, response: LLMResponse):
-        """When LLM responds, check if recall tag is present and mark the event.
+        """When LLM responds, strip control tags from the response text.
 
-        This fires BEFORE the result is set and BEFORE history is saved.
-        We mark the event so that after_message_sent can handle recall.
-        We do NOT modify the response here - history should contain the full text.
+        This fires AFTER the assistant message is appended to run_context.messages
+        but BEFORE history is saved. We:
+        1. Save the original text (with tags) in event extras for on_decorating_result
+        2. Strip all control tags from response.completion_text
+        3. Patch the last assistant message in run_context.messages so that
+           the cleaned text is what gets persisted to conversation history.
+
+        This prevents tags like [recall], [reply:ID], [poke] from appearing
+        in saved history, which would cause issues with plugins like amnesia
+        that display or re-parse conversation history.
         """
-        if not self.recall_enable:
-            return
         if not isinstance(event, AiocqhttpMessageEvent):
             return
         if event.get_group_id():
             return
 
         text = response.completion_text if response else ""
-        if not text or self.recall_tag not in text:
+        if not text:
             return
 
-        # Mark this event as needing recall processing
-        event.set_extra("_recall_pending", True)
-        event.set_extra("_recall_full_text", text)
-        logger.info("[ActiveFunction] LLM response contains recall tag, marked event.")
+        # Check if any of our control tags are present
+        has_recall = self.recall_tag in text
+        has_poke = self.poke_tag in text
+        has_reply = bool(re.search(r"\[reply:\d+\]", text))
+
+        if not has_recall and not has_poke and not has_reply:
+            return
+
+        # Save original text with tags for on_decorating_result handlers
+        event.set_extra("_active_func_original_text", text)
+
+        if has_recall:
+            event.set_extra("_recall_pending", True)
+            event.set_extra("_recall_full_text", text)
+
+        # Strip all control tags from the response so history is clean
+        cleaned = text
+        if has_recall:
+            cleaned = cleaned.replace(self.recall_tag, "")
+        if has_poke:
+            cleaned = cleaned.replace(self.poke_tag, "")
+        if has_reply:
+            cleaned = re.sub(r"\[reply:\d+\]", "", cleaned)
+
+        # Clean up extra whitespace left by tag removal
+        cleaned = re.sub(r"  +", " ", cleaned).strip()
+
+        # Update the response object
+        response.completion_text = cleaned
+
+        # Also directly modify result_chain if it exists (belt and suspenders)
+        if response.result_chain and response.result_chain.chain:
+            for i, comp in enumerate(response.result_chain.chain):
+                if isinstance(comp, Plain):
+                    new_text = comp.text
+                    if has_recall:
+                        new_text = new_text.replace(self.recall_tag, "")
+                    if has_poke:
+                        new_text = new_text.replace(self.poke_tag, "")
+                    if has_reply:
+                        new_text = re.sub(r"\[reply:\d+\]", "", new_text)
+                    new_text = re.sub(r"  +", " ", new_text).strip()
+                    if new_text != comp.text:
+                        response.result_chain.chain[i] = Plain(new_text)
+
+        # Also patch the last assistant message in run_context.messages
+        # (it was already appended before this hook fires)
+        self._patch_last_assistant_message(event, cleaned)
+
+        logger.info(
+            "[ActiveFunction] Stripped control tags from LLM response for history. "
+            f"recall={has_recall}, poke={has_poke}, reply={has_reply}"
+        )
+
+    def _patch_last_assistant_message(self, event: AstrMessageEvent, cleaned_text: str):
+        """Patch the last assistant message in run_context.messages with cleaned text.
+
+        The agent runner appends the assistant message to run_context.messages BEFORE
+        calling on_agent_done (which triggers on_llm_response). We need to find and
+        modify the TextPart in that message so the cleaned text is saved to history.
+        """
+        try:
+            from astrbot.core.pipeline.process_stage.follow_up import (
+                _ACTIVE_AGENT_RUNNERS,
+            )
+
+            runner = _ACTIVE_AGENT_RUNNERS.get(event.unified_msg_origin)
+            if not runner or not hasattr(runner, "run_context"):
+                return
+
+            messages = runner.run_context.messages
+            if not messages:
+                return
+
+            # Find the last assistant message
+            last_msg = messages[-1]
+            if getattr(last_msg, "role", None) != "assistant":
+                return
+
+            # Patch TextPart in the message content
+            content = getattr(last_msg, "content", None)
+            if not content:
+                return
+
+            if isinstance(content, list):
+                for part in content:
+                    if (
+                        hasattr(part, "type")
+                        and part.type == "text"
+                        and hasattr(part, "text")
+                    ):
+                        part.text = cleaned_text
+                        break
+            elif isinstance(content, str):
+                last_msg.content = cleaned_text
+        except Exception as e:
+            logger.debug(f"[ActiveFunction] Failed to patch assistant message: {e}")
 
     # ==================== on_decorating_result (non-streaming) ====================
 
@@ -591,19 +859,30 @@ class ActiveFunctionPlugin(Star):
             return
         if event.get_group_id():
             return
+        # Skip if already handled by streaming poke fix
+        if event.get_extra("_recall_handled"):
+            return
 
-        # Get plain text from chain
-        full_text = ""
-        for comp in result.chain:
-            if isinstance(comp, Plain):
-                full_text += comp.text
+        # Use original text from on_llm_response if available (tags were stripped for history)
+        original_text = event.get_extra("_active_func_original_text")
+        if original_text and self.recall_tag in original_text:
+            # Strip [poke] since poke handler already executed the action
+            full_text = original_text.replace(self.poke_tag, "")
+        else:
+            # Fallback: get plain text from chain
+            full_text = ""
+            for comp in result.chain:
+                if isinstance(comp, Plain):
+                    full_text += comp.text
 
         if self.recall_tag not in full_text:
             return
 
         # If recall is disabled, just strip the tags and let normal sending proceed
         if not self.recall_enable:
-            logger.debug("[ActiveFunction] Recall disabled, stripping recall tags from output")
+            logger.debug(
+                "[ActiveFunction] Recall disabled, stripping recall tags from output"
+            )
             stripped_text = full_text.replace(self.recall_tag, "")
             # Rebuild chain with stripped text
             new_chain = []
