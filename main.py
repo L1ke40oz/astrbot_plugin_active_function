@@ -3,7 +3,7 @@ import re
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import Plain, Record
+from astrbot.api.message_components import Image, Plain, Record
 from astrbot.api.star import Context, Star, register
 from astrbot.core.config.astrbot_config import AstrBotConfig
 from astrbot.core.message.components import BaseMessageComponent
@@ -161,6 +161,10 @@ class ActiveFunctionPlugin(Star):
 
         Priority 100 ensures this runs BEFORE the debounce plugin (priority 50).
         We do NOT stop the event, so debounce can still merge messages normally.
+
+        Supports caching messages that contain images or voice (Record) by
+        generating descriptive placeholders like [图片] or [语音], so the LLM
+        can reference them via [reply:ID] even if there's no text content.
         """
         if not self.reply_enable:
             return
@@ -176,11 +180,39 @@ class ActiveFunctionPlugin(Star):
             )
             return
 
-        text = (event.message_str or "").strip()
+        # Build display text from message chain, including media placeholders
+        text = self._build_cache_text(event)
         if not text:
             return
 
         self._reply_mgr.cache_message(event.unified_msg_origin, message_id, text)
+
+    def _build_cache_text(self, event: AiocqhttpMessageEvent) -> str:
+        """Build display text for cache from the message chain.
+
+        For text-only messages, returns the plain text.
+        For messages with images/voice, appends descriptive placeholders
+        so the LLM knows the message contained media and can reference it.
+        """
+        msg_obj = getattr(event, "message_obj", None)
+        message_chain = getattr(msg_obj, "message", None) if msg_obj else None
+
+        if not message_chain:
+            # Fallback to message_str
+            return (event.message_str or "").strip()
+
+        parts = []
+        for comp in message_chain:
+            if isinstance(comp, Plain):
+                t = comp.text.strip()
+                if t:
+                    parts.append(t)
+            elif isinstance(comp, Image):
+                parts.append("[图片]")
+            elif isinstance(comp, Record):
+                parts.append("[语音]")
+
+        return " ".join(parts).strip()
 
     # ==================== Poke: Event Interception ====================
 
@@ -514,7 +546,9 @@ class ActiveFunctionPlugin(Star):
             # Strip <tts>...</tts> tags — TTS plugin already converted them to Record
             # components which are preserved as non-Plain in the chain below.
             # Keep only the text outside the tags; the TTS audio is sent via Record.
-            text_for_reply = re.sub(r"<tts>.*?</tts>", "", text_for_reply, flags=re.DOTALL)
+            text_for_reply = re.sub(
+                r"<tts>.*?</tts>", "", text_for_reply, flags=re.DOTALL
+            )
             # Clean up extra whitespace left by tag removal
             text_for_reply = re.sub(r"  +", " ", text_for_reply).strip()
             # Use original text with tags; preserve non-Plain components from chain

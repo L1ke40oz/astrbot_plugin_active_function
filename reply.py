@@ -22,7 +22,7 @@ class CachedMessage:
     """A cached user message for reply targeting."""
 
     message_id: int
-    text: str
+    text: str  # Display text for prompt (may include media placeholders like [图片])
     timestamp: float = field(default_factory=time.time)
 
 
@@ -109,7 +109,9 @@ class ReplyManager:
             if item.message_id == message_id:
                 return
 
-        queue.append(CachedMessage(message_id=message_id, text=text, timestamp=time.time()))
+        queue.append(
+            CachedMessage(message_id=message_id, text=text, timestamp=time.time())
+        )
         logger.debug(
             f"[ActiveFunction] Reply cache: stored mid={message_id}, text={text[:40]}"
         )
