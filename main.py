@@ -423,10 +423,11 @@ class ActiveFunctionPlugin(Star):
             # Recall the message with [poke] tag
             await bot.delete_msg(message_id=int(target_msg_id))
 
-            # Re-send without [poke] (also strip [recall] and [reply:ID] if present)
+            # Re-send without [poke] (also strip [recall], [reply:ID], and <tts> tags)
             clean_text = original_text.replace(self.poke_tag, "")
             clean_text = clean_text.replace(self.recall_tag, "")
             clean_text = re.sub(r"\[reply:\d+\]", "", clean_text)
+            clean_text = re.sub(r"<tts>.*?</tts>", "", clean_text, flags=re.DOTALL)
             clean_text = re.sub(r"  +", " ", clean_text).strip()
 
             if clean_text:
@@ -504,10 +505,18 @@ class ActiveFunctionPlugin(Star):
         # When original_text is available (tags were stripped for history saving),
         # we use it as the text source instead of the chain's cleaned text.
         # We must strip [poke] from it since the poke handler already executed the action.
+        # We must also strip <tts>...</tts> tags since the TTS plugin (priority 13)
+        # already processed them into Record components in the chain.
         ordered_chunks: list[str | BaseMessageComponent] = []
         if original_text and re.search(r"\[reply:\d+\]", original_text):
             # Use original text with reply tags; strip [poke] since it's already handled
             text_for_reply = original_text.replace(self.poke_tag, "")
+            # Strip <tts>...</tts> tags — TTS plugin already converted them to Record
+            # components which are preserved as non-Plain in the chain below.
+            # Keep only the text outside the tags; the TTS audio is sent via Record.
+            text_for_reply = re.sub(r"<tts>.*?</tts>", "", text_for_reply, flags=re.DOTALL)
+            # Clean up extra whitespace left by tag removal
+            text_for_reply = re.sub(r"  +", " ", text_for_reply).strip()
             # Use original text with tags; preserve non-Plain components from chain
             non_plain_components = [
                 comp for comp in result.chain if not isinstance(comp, Plain)
@@ -868,6 +877,10 @@ class ActiveFunctionPlugin(Star):
         if original_text and self.recall_tag in original_text:
             # Strip [poke] since poke handler already executed the action
             full_text = original_text.replace(self.poke_tag, "")
+            # Strip <tts>...</tts> tags — TTS plugin already converted them to Record
+            # components; sending raw tags as text would leak them to the user.
+            full_text = re.sub(r"<tts>.*?</tts>", "", full_text, flags=re.DOTALL)
+            full_text = re.sub(r"  +", " ", full_text).strip()
         else:
             # Fallback: get plain text from chain
             full_text = ""
