@@ -1,0 +1,141 @@
+{
+    "segment_separator": {
+        "description": "分段正则表达式",
+        "type": "string",
+        "hint": "用于分割 Bot 回复为多条消息的正则表达式（全局生效，撤回和引用回复均使用此规则）。与 AstrBot 分段正则表达式填写方式一致。留空则不启用分段。示例：[^$\\\\]+ 表示按$、\\\\ 分段",
+        "default": ""
+    },
+    "segment_interval": {
+        "description": "分段发送间隔（秒）",
+        "type": "float",
+        "hint": "分段发送时，每条消息之间的间隔时间",
+        "slider": {
+            "min": 0.5,
+            "max": 10,
+            "step": 0.5
+        },
+        "default": 1.5
+    },
+    "recall": {
+        "description": "【消息撤回】",
+        "type": "object",
+        "hint": "Bot 可通过在回复中使用 [recall] 标签来撤回该条消息。支持分段发送场景下对单段撤回。当前仅支持 aiocqhttp 平台私聊。",
+        "items": {
+            "enable": {
+                "description": "启用撤回功能",
+                "type": "bool",
+                "hint": "开启后，Bot 回复中包含 [recall] 标签的消息将在发送后自动撤回",
+                "default": true
+            },
+            "recall_delay": {
+                "description": "撤回延迟（秒）",
+                "type": "float",
+                "hint": "消息发送后经过多少秒执行撤回，让用户有时间看到消息内容",
+                "slider": {
+                    "min": 0.5,
+                    "max": 30,
+                    "step": 0.5
+                },
+                "default": 5
+            },
+            "recall_tag": {
+                "description": "撤回标签",
+                "type": "string",
+                "hint": "LLM 回复中用于标记需要撤回的标签文本，默认为 [recall]",
+                "default": "[recall]"
+            }
+        }
+    },
+    "reply": {
+        "description": "【引用回复】",
+        "type": "object",
+        "hint": "Bot 可通过 [reply:ID] 标签引用用户之前的消息进行回复。系统会在消息防抖合并前缓存每条原始消息的 ID，供 LLM 引用。当前仅支持 aiocqhttp 平台私聊。",
+        "items": {
+            "enable": {
+                "description": "启用引用回复功能",
+                "type": "bool",
+                "hint": "开启后，Bot 可以引用用户之前发送的消息进行回复",
+                "default": true
+            },
+            "cache_ttl": {
+                "description": "消息缓存有效期（秒）",
+                "type": "int",
+                "hint": "缓存的用户消息超过此时间后将被清除，不再可被引用",
+                "default": 600
+            },
+            "cache_max_per_session": {
+                "description": "每个会话最大缓存消息数",
+                "type": "int",
+                "hint": "每个用户会话最多缓存多少条消息用于引用",
+                "default": 50
+            }
+        }
+    },
+    "poke": {
+        "description": "【戳一戳】",
+        "type": "object",
+        "hint": "用户戳 Bot 时触发 LLM 响应，Bot 也可以通过 [poke] 标签主动戳用户。当前仅支持 aiocqhttp 平台私聊。",
+        "items": {
+            "enable": {
+                "description": "启用戳一戳功能",
+                "type": "bool",
+                "hint": "开启后，用户戳 Bot 会触发 LLM 响应，Bot 回复中的 [poke] 标签会执行戳一戳动作",
+                "default": true
+            },
+            "cooldown": {
+                "description": "冷却时间（秒）",
+                "type": "float",
+                "hint": "同一用户连续戳一戳的最小间隔时间，防止刷屏",
+                "slider": {
+                    "min": 1,
+                    "max": 60,
+                    "step": 1
+                },
+                "default": 5.0
+            },
+            "poke_prompt": {
+                "description": "戳一戳提示词",
+                "type": "text",
+                "hint": "用户戳 Bot 时发送给 LLM 的提示词。$username 可作为占位符替换为用户名。可自由修改戳一戳提示词后缀",
+                "default": "[这是一个真实的戳一戳动作] $username 戳了戳你。"
+            },
+            "poke_tag": {
+                "description": "戳一戳标签",
+                "type": "string",
+                "hint": "LLM 回复中用于标记需要执行戳一戳动作的标签文本",
+                "default": "[poke]"
+            }
+        }
+    },
+    "prompt": {
+        "description": "【提示词注入】",
+        "type": "object",
+        "hint": "自动注入到 LLM system prompt 中的指令，告知 AI 如何使用各项主动功能的格式",
+        "items": {
+            "enable": {
+                "description": "启用提示词注入",
+                "type": "bool",
+                "hint": "开启后，会在每次 LLM 请求时自动追加功能说明到 system prompt",
+                "default": true
+            },
+            "recall_prompt": {
+                "description": "撤回功能提示词",
+                "type": "text",
+                "hint": "告知 AI 如何使用撤回标签的提示词。支持 {recall_tag} 占位符，会被替换为实际配置的标签",
+                "default": "你可以在回复中使用 {recall_tag} 标签来标记需要在发送后短暂展示然后自动撤回的内容。当你想表达一些吐槽、或者\"说完就后悔\"的内容时可以使用它。标签放在句首，表示这一整句（到下一个分隔符或句末为止）需要撤回。示例：\"{recall_tag}其实我觉得你很可爱\"。带有该标签的消息会在用户看到几秒后自动撤回。注意：只有紧跟在 {recall_tag} 后面的那一段会被撤回，后续内容正常发送。"
+            },
+            "reply_prompt": {
+                "description": "引用回复提示词",
+                "type": "text",
+                "hint": "告知 AI 如何使用引用回复标签的提示词。支持 {message_list} 和 {reply_tag} 占位符",
+                "default": "你可以引用用户之前发送的消息进行回复。使用 {reply_tag} 标签（将 ID 替换为下方消息列表中的数字 ID）放在回复内容开头即可。用户不会看到该标签，系统会将其转换为 QQ 原生引用回复。以下是最近可引用的消息列表：\n{message_list}\n重要规则：\n1. 只在你确实想针对某条特定消息回应时才使用引用。大多数情况下不需要引用。\n2. ID 只能从上方消息列表中选取，禁止使用列表中不存在的数字。\n3. 不要复述被引用的原文。"
+            },
+            "poke_prompt": {
+                "description": "戳一戳功能提示词",
+                "type": "text",
+                "hint": "告知 AI 如何使用戳一戳标签的提示词。支持 {poke_tag} 占位符",
+                "default": "你可以在回复中使用 {poke_tag} 标签来戳对方。当你想表达亲昵或者想引起对方注意时可以使用它。标签可以放在回复文本的任意位置，系统会在发送该段消息后执行戳一戳动作。示例：\"在做什么 {poke_tag}\"。注意：每条回复最多使用一次 {poke_tag}。"
+            }
+        }
+    }
+}
