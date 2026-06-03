@@ -170,6 +170,52 @@ class ActiveFunctionPlugin(Star):
             return not self.group_enable
         return False
 
+    def _own_plugin_name(self) -> str:
+        """Best-effort resolve this plugin's registered name for session checks."""
+        try:
+            from astrbot.core.star.star import star_map
+
+            meta = star_map.get(self.__class__.__module__)
+            if meta and meta.name:
+                return meta.name
+        except Exception:
+            pass
+        return "astrbot_plugin_active_function"
+
+    async def _session_inactive(self, event: AstrMessageEvent) -> bool:
+        """Whether this plugin is disabled for the current session.
+
+        AstrBot's per-session plugin management (会话自定义规则) only filters
+        command / message handlers; lifecycle hooks such as on_llm_request and
+        on_decorating_result are NOT filtered by it. Without this guard our
+        prompt would still be injected (and tags processed) in a session where
+        the user disabled the plugin via custom rules. We honour that session
+        config ourselves here. Fails open (returns False) when the API is
+        unavailable, preserving behaviour on frameworks without this feature.
+        """
+        try:
+            from astrbot.core.star.session_plugin_manager import (
+                SessionPluginManager,
+            )
+        except Exception:
+            return False
+        try:
+            enabled = await SessionPluginManager.is_plugin_enabled_for_session(
+                event.unified_msg_origin, self._own_plugin_name()
+            )
+            return not enabled
+        except Exception:
+            return False
+
+    async def _disabled(self, event: AstrMessageEvent) -> bool:
+        """Combined hook guard: scene disabled (group toggle) OR session-disabled.
+
+        Lets every lifecycle hook bail out both when the chat scene is off
+        (private/group toggle) and when the plugin has been disabled for this
+        session via AstrBot custom rules.
+        """
+        return self._scene_disabled(event) or await self._session_inactive(event)
+
     async def _send_msg(self, event: AiocqhttpMessageEvent, bot, message: list):
         """Send a OneBot message payload to the correct target.
 
@@ -396,7 +442,7 @@ class ActiveFunctionPlugin(Star):
         if platform_name != "aiocqhttp":
             return
 
-        if self._scene_disabled(event):
+        if await self._disabled(event):
             return
 
         result = event.get_result()
@@ -675,7 +721,7 @@ class ActiveFunctionPlugin(Star):
         """
         if not isinstance(event, AiocqhttpMessageEvent):
             return
-        if self._scene_disabled(event):
+        if await self._disabled(event):
             return
         # Skip if already handled by streaming poke fix
         if event.get_extra("_recall_handled"):
@@ -909,6 +955,8 @@ class ActiveFunctionPlugin(Star):
         annotate rewrites them into summaries, keep leaves them untouched).
         This only mutates the in-flight request context, not the stored history.
         """
+        if await self._session_inactive(event):
+            return
         if not self.prompt_enable:
             return
         suffix = self._build_system_prompt_suffix(event)
@@ -1020,7 +1068,7 @@ class ActiveFunctionPlugin(Star):
         """
         if not isinstance(event, AiocqhttpMessageEvent):
             return
-        if self._scene_disabled(event):
+        if await self._disabled(event):
             return
 
         text = response.completion_text if response else ""
@@ -1115,7 +1163,7 @@ class ActiveFunctionPlugin(Star):
 
         if not isinstance(event, AiocqhttpMessageEvent):
             return
-        if self._scene_disabled(event):
+        if await self._disabled(event):
             return
         # Skip if already handled by streaming poke fix
         if event.get_extra("_recall_handled"):
@@ -1188,7 +1236,7 @@ class ActiveFunctionPlugin(Star):
             return
         if not isinstance(event, AiocqhttpMessageEvent):
             return
-        if self._scene_disabled(event):
+        if await self._disabled(event):
             return
 
         # Skip if already handled by on_decorating_result
@@ -1328,6 +1376,8 @@ class ActiveFunctionPlugin(Star):
         This ensures the wakeup plugin's scheduling tags never leak to the user,
         even when the message doesn't go through reply/recall handling paths.
         """
+        if await self._session_inactive(event):
+            return
         result = event.get_result()
         if not result or not result.chain:
             return
