@@ -22,7 +22,7 @@ _NEXT_TAG_PATTERN = re.compile(r"\[?\s*(?:next|Next|NEXT)\s*(?:[:\uff1a]\s*[^\]]
 
 @register(
     "astrbot_plugin_active_function",
-    "YourName",
+    "L1ke40oz",
     "为 Bot 提供主动能力：撤回消息、引用回复、戳一戳等",
     "0.1.0",
 )
@@ -101,7 +101,7 @@ class ActiveFunctionPlugin(Star):
             "标签可以放在回复文本的任意位置：系统会在发送到该标签所在的那一段消息之后，"
             "立即执行戳一戳动作，因此你可以把它放在某句话之后，在对话进行到一半时戳对方。"
             "若开启了分段发送，戳一戳会出现在它所在分段的位置；一条回复里可以使用多次。"
-            '示例："等你好久啦{poke_tag}……快点嘛"。',
+            '示例："陪我玩一会{poke_tag}可以吗"。',
         )
 
         # Initialize poke manager

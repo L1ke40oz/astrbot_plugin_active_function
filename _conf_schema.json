@@ -2,7 +2,7 @@
     "segment_separator": {
         "description": "分段正则表达式",
         "type": "string",
-        "hint": "用于分割 Bot 回复为多条消息的正则表达式（全局生效，撤回和引用回复均使用此规则）。与 AstrBot 分段正则表达式填写方式一致。留空则不启用分段。示例：[^$\\\\]+ 表示按$、\\\\ 分段",
+        "hint": "用于分割多条消息的正则表达式（全局生效，撤回和引用回复均使用此规则）。与 AstrBot 分段正则表达式填写方式一致。留空则不启用分段。示例：[^$\\\\]+ 表示按$、\\\\ 分段",
         "default": ""
     },
     "segment_interval": {
@@ -19,7 +19,7 @@
     "group": {
         "description": "【群聊支持】",
         "type": "object",
-        "hint": "总开关：是否在群聊中启用撤回 / 引用回复 / 戳一戳功能。默认关闭（仅私聊生效）。开启后这三项功能（仍受各自开关控制）也会在群聊中生效。",
+        "hint": "是否在群聊中启用撤回 / 引用回复 / 戳一戳功能。默认关闭（仅私聊生效）。开启后这三项功能（仍受各自开关控制）也会在群聊中生效。",
         "items": {
             "enable": {
                 "description": "在群聊中启用本插件功能",
@@ -62,7 +62,7 @@
     "reply": {
         "description": "【引用回复】",
         "type": "object",
-        "hint": "Bot 可通过 [reply:ID] 标签引用用户之前的消息进行回复。系统会在消息防抖合并前缓存每条原始消息的 ID，供 LLM 引用。支持 aiocqhttp 私聊；群聊需在【群聊支持】中开启总开关（群聊下可引用列表会带上发言人，便于区分多人消息）。",
+        "hint": "Bot 可通过 [reply:ID] 标签引用用户之前的消息进行回复。",
         "items": {
             "enable": {
                 "description": "启用引用回复功能",
@@ -87,7 +87,7 @@
     "poke": {
         "description": "【戳一戳】",
         "type": "object",
-        "hint": "用户戳 Bot 时触发 LLM 响应，Bot 也可以通过 [poke] 标签主动戳用户。支持 aiocqhttp 私聊；群聊需在【群聊支持】中开启总开关（群聊戳一戳依赖 OneBot 的 group_poke 接口，不支持时静默跳过）。",
+        "hint": "用户戳 Bot 时触发 LLM 响应，Bot 也可以通过 [poke] 标签主动戳用户。",
         "items": {
             "enable": {
                 "description": "启用戳一戳功能",
@@ -123,7 +123,7 @@
     "history": {
         "description": "【对话历史中的标签处理】",
         "type": "object",
-        "hint": "控制 [recall]/[reply:ID]/[poke] 标签如何写入对话历史/对话数据。注意：这只影响保存到对话记录里的文本，不影响发送给用户的消息（发送内容始终会过滤掉标签）。",
+        "hint": "控制 [recall]/[reply:ID]/[poke] 标签如何写入对话历史/对话数据。只影响保存到对话记录里的文本，不影响发送给用户的消息（发送内容始终会过滤掉标签）。",
         "items": {
             "tag_mode": {
                 "description": "历史标签处理方式",
@@ -133,11 +133,11 @@
                     "keep",
                     "annotate"
                 ],
-                "hint": "strip=从历史中剥离标签（历史干净，但 AI 不知道自己引用/撤回过什么）；keep=原样保留标签（AI 能看到，但说几句就一堆标签，且可能照抄已失效的引用 ID）；annotate=把标签替换成可自定义的摘要文字（推荐：既让 AI 记得自己引用/撤回了什么，又不会污染上下文）。",
+                "hint": "strip=从历史中剥离标签（历史干净，但 AI 不知道自己引用/撤回过什么）；keep=原样保留标签（AI 能看到原始标签，但可能污染上下文或引用过期 ID）；annotate=把标签替换成可自定义的摘要文字（让 AI 记得自己引用/撤回了什么，不会污染上下文）。",
                 "default": "annotate"
             },
             "annotate_reply_template": {
-                "description": "引用标签摘要模板",
+                "description": "引用标签摘要",
                 "type": "string",
                 "hint": "annotate 模式下 [reply:ID] 会被替换成这段文字写入历史。占位符：{quote}=被引用消息内容（截断 30 字，缓存过期则为空），{id}=被引用消息 ID。",
                 "default": "（引用了「{quote}」）",
