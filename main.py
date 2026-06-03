@@ -716,10 +716,10 @@ class ActiveFunctionPlugin(Star):
     async def inject_prompt(self, event: AstrMessageEvent, request: ProviderRequest):
         """Inject function usage instructions into the LLM system prompt.
 
-        Also strips any control tags that may have leaked into conversation history
-        (from before the on_llm_response fix, or from streaming mode fallback).
-        This prevents the LLM from seeing stale tags in its context and producing
-        unexpected segmentation or behavior.
+        Control tags ([recall], [reply:ID], [poke]) are intentionally NOT
+        stripped from the conversation history here: they are kept in the saved
+        conversation data and remain visible to the LLM in its context, while
+        only the message sent to the user is filtered (in on_decorating_result).
         """
         if not self.prompt_enable:
             return
@@ -727,58 +727,22 @@ class ActiveFunctionPlugin(Star):
         if suffix:
             request.system_prompt += "\n\n" + suffix
 
-        # Clean control tags from conversation history contexts
-        self._clean_history_tags(request)
-
-    def _clean_history_tags(self, request: ProviderRequest):
-        """Strip control tags from assistant messages in conversation history.
-
-        This ensures the LLM never sees [recall], [poke], or [reply:ID] tags
-        in its context, even if they were saved to history before the fix.
-        """
-        if not request.contexts:
-            return
-
-        tag_pattern = re.compile(
-            re.escape(self.recall_tag)
-            + r"|"
-            + re.escape(self.poke_tag)
-            + r"|\[reply:\d+\]"
-        )
-
-        for ctx in request.contexts:
-            if not isinstance(ctx, dict):
-                continue
-            if ctx.get("role") != "assistant":
-                continue
-
-            content = ctx.get("content")
-            if isinstance(content, str):
-                if tag_pattern.search(content):
-                    ctx["content"] = tag_pattern.sub("", content).strip()
-            elif isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        text = part.get("text", "")
-                        if tag_pattern.search(text):
-                            part["text"] = tag_pattern.sub("", text).strip()
-
     # ==================== LLM Response Hook ====================
 
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, response: LLMResponse):
-        """When LLM responds, strip control tags from the response text.
+        """When LLM responds, record the control tags for the sending stage.
 
-        This fires AFTER the assistant message is appended to run_context.messages
-        but BEFORE history is saved. We:
-        1. Save the original text (with tags) in event extras for on_decorating_result
-        2. Strip all control tags from response.completion_text
-        3. Patch the last assistant message in run_context.messages so that
-           the cleaned text is what gets persisted to conversation history.
+        We only stash the original text (with tags) in event extras so the
+        on_decorating_result handlers can execute the corresponding actions
+        (poke / reply / recall) and filter the tags out of what is actually
+        sent to the user.
 
-        This prevents tags like [recall], [reply:ID], [poke] from appearing
-        in saved history, which would cause issues with plugins like amnesia
-        that display or re-parse conversation history.
+        We intentionally do NOT strip the tags from response.completion_text
+        or from the assistant message in run_context.messages: the control
+        tags must remain visible in the saved conversation data. Filtering
+        only happens later in on_decorating_result, so users never see the
+        tags even though the conversation history keeps them.
         """
         if not isinstance(event, AiocqhttpMessageEvent):
             return
@@ -797,95 +761,21 @@ class ActiveFunctionPlugin(Star):
         if not has_recall and not has_poke and not has_reply:
             return
 
-        # Save original text with tags for on_decorating_result handlers
+        # Stash original text (with tags) for the on_decorating_result handlers.
+        # The tags are intentionally left in completion_text / run_context so they
+        # remain in the saved conversation history; only the message sent to the
+        # user is filtered (later, in on_decorating_result).
         event.set_extra("_active_func_original_text", text)
 
         if has_recall:
             event.set_extra("_recall_pending", True)
             event.set_extra("_recall_full_text", text)
 
-        # Strip all control tags from the response so history is clean
-        cleaned = text
-        if has_recall:
-            cleaned = cleaned.replace(self.recall_tag, "")
-        if has_poke:
-            cleaned = cleaned.replace(self.poke_tag, "")
-        if has_reply:
-            cleaned = re.sub(r"\[reply:\d+\]", "", cleaned)
-
-        # Clean up extra whitespace left by tag removal
-        cleaned = re.sub(r"  +", " ", cleaned).strip()
-
-        # Update the response object
-        response.completion_text = cleaned
-
-        # Also directly modify result_chain if it exists (belt and suspenders)
-        if response.result_chain and response.result_chain.chain:
-            for i, comp in enumerate(response.result_chain.chain):
-                if isinstance(comp, Plain):
-                    new_text = comp.text
-                    if has_recall:
-                        new_text = new_text.replace(self.recall_tag, "")
-                    if has_poke:
-                        new_text = new_text.replace(self.poke_tag, "")
-                    if has_reply:
-                        new_text = re.sub(r"\[reply:\d+\]", "", new_text)
-                    new_text = re.sub(r"  +", " ", new_text).strip()
-                    if new_text != comp.text:
-                        response.result_chain.chain[i] = Plain(new_text)
-
-        # Also patch the last assistant message in run_context.messages
-        # (it was already appended before this hook fires)
-        self._patch_last_assistant_message(event, cleaned)
-
         logger.info(
-            "[ActiveFunction] Stripped control tags from LLM response for history. "
+            "[ActiveFunction] Detected control tags in LLM response "
+            "(kept in conversation history, filtered from output). "
             f"recall={has_recall}, poke={has_poke}, reply={has_reply}"
         )
-
-    def _patch_last_assistant_message(self, event: AstrMessageEvent, cleaned_text: str):
-        """Patch the last assistant message in run_context.messages with cleaned text.
-
-        The agent runner appends the assistant message to run_context.messages BEFORE
-        calling on_agent_done (which triggers on_llm_response). We need to find and
-        modify the TextPart in that message so the cleaned text is saved to history.
-        """
-        try:
-            from astrbot.core.pipeline.process_stage.follow_up import (
-                _ACTIVE_AGENT_RUNNERS,
-            )
-
-            runner = _ACTIVE_AGENT_RUNNERS.get(event.unified_msg_origin)
-            if not runner or not hasattr(runner, "run_context"):
-                return
-
-            messages = runner.run_context.messages
-            if not messages:
-                return
-
-            # Find the last assistant message
-            last_msg = messages[-1]
-            if getattr(last_msg, "role", None) != "assistant":
-                return
-
-            # Patch TextPart in the message content
-            content = getattr(last_msg, "content", None)
-            if not content:
-                return
-
-            if isinstance(content, list):
-                for part in content:
-                    if (
-                        hasattr(part, "type")
-                        and part.type == "text"
-                        and hasattr(part, "text")
-                    ):
-                        part.text = cleaned_text
-                        break
-            elif isinstance(content, str):
-                last_msg.content = cleaned_text
-        except Exception as e:
-            logger.debug(f"[ActiveFunction] Failed to patch assistant message: {e}")
 
     # ==================== on_decorating_result (non-streaming) ====================
 
