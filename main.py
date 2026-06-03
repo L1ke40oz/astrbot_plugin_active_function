@@ -31,6 +31,13 @@ class ActiveFunctionPlugin(Star):
         super().__init__(context)
         self.config = config
 
+        # group support: master toggle for using these features in group chats.
+        # When off (default), the plugin only acts in private chats, preserving
+        # the original behavior. When on, recall/reply/poke also work in groups
+        # (each still gated by its own enable flag).
+        group_cfg = config.get("group", {})
+        self.group_enable: bool = group_cfg.get("enable", False)
+
         # recall config
         recall_cfg = config.get("recall", {})
         self.recall_enable: bool = recall_cfg.get("enable", True)
@@ -148,8 +155,43 @@ class ActiveFunctionPlugin(Star):
         except ValueError:
             pass
 
+    def _scene_disabled(self, event: AstrMessageEvent) -> bool:
+        """Whether this event's chat scene is disabled for active-function features.
+
+        Private chat is always enabled. Group chat is only enabled when the
+        master group toggle (``group.enable``) is on. Used as the single guard
+        in every hook so private behavior is unchanged when groups are off.
+        """
+        if event.get_group_id():
+            return not self.group_enable
+        return False
+
+    async def _send_msg(self, event: AiocqhttpMessageEvent, bot, message: list):
+        """Send a OneBot message payload to the correct target.
+
+        Routes to the group endpoint (``send_group_msg``) in group chats and to
+        the private endpoint (``send_private_msg``) otherwise, so the reply /
+        recall / poke flows work in both scenes. Returns the OneBot send result
+        dict (which contains ``message_id``); callers wrap this in try/except.
+        """
+        gid = event.get_group_id()
+        if gid:
+            return await bot.send_group_msg(group_id=int(gid), message=message)
+        return await bot.send_private_msg(
+            user_id=int(event.get_sender_id()), message=message
+        )
+
     def _build_system_prompt_suffix(self, event: AstrMessageEvent | None = None) -> str:
-        """Build the system prompt suffix from configured templates."""
+        """Build the system prompt suffix from configured templates.
+
+        When the event's scene is disabled (e.g. a group chat while group
+        support is off), we advertise none of the tags. Otherwise the LLM might
+        emit [recall]/[poke] in a scene where the handlers skip processing,
+        leaking the raw tags to users.
+        """
+        if event is not None and self._scene_disabled(event):
+            return ""
+
         parts = []
         if self.recall_enable and self.recall_prompt_template:
             recall_prompt = self.recall_prompt_template.replace(
@@ -162,7 +204,7 @@ class ActiveFunctionPlugin(Star):
             self.reply_enable
             and event is not None
             and isinstance(event, AiocqhttpMessageEvent)
-            and not event.get_group_id()
+            and not self._scene_disabled(event)
         ):
             reply_prompt = self._reply_mgr.build_reply_prompt(event.unified_msg_origin)
             if reply_prompt:
@@ -182,7 +224,7 @@ class ActiveFunctionPlugin(Star):
 
     # ==================== Reply: Message Caching ====================
 
-    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=100)
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
     async def cache_user_message(self, event: AstrMessageEvent):
         """Cache original user message before debounce plugin merges it.
 
@@ -197,7 +239,7 @@ class ActiveFunctionPlugin(Star):
             return
         if not isinstance(event, AiocqhttpMessageEvent):
             return
-        if event.get_group_id():
+        if self._scene_disabled(event):
             return
 
         message_id = self._reply_mgr.extract_message_id(event)
@@ -212,7 +254,20 @@ class ActiveFunctionPlugin(Star):
         if not text:
             return
 
-        self._reply_mgr.cache_message(event.unified_msg_origin, message_id, text)
+        # In group chats, attach a sender label so the quotable-message list can
+        # show who said what (private chats only have one speaker, so skip it).
+        sender = ""
+        if event.get_group_id():
+            name = (event.get_sender_name() or "").strip()
+            uid = str(event.get_sender_id() or "").strip()
+            if name and uid:
+                sender = f"{name}({uid})"
+            else:
+                sender = name or uid
+
+        self._reply_mgr.cache_message(
+            event.unified_msg_origin, message_id, text, sender=sender
+        )
 
     def _build_cache_text(self, event: AiocqhttpMessageEvent) -> str:
         """Build display text for cache from the message chain.
@@ -257,8 +312,7 @@ class ActiveFunctionPlugin(Star):
         if not isinstance(event, AiocqhttpMessageEvent):
             return
 
-        # Private chat only
-        if event.get_group_id():
+        if self._scene_disabled(event):
             return
 
         # Get raw message to check for poke event
@@ -338,8 +392,7 @@ class ActiveFunctionPlugin(Star):
         if platform_name != "aiocqhttp":
             return
 
-        # Private chat only
-        if event.get_group_id():
+        if self._scene_disabled(event):
             return
 
         result = event.get_result()
@@ -395,9 +448,16 @@ class ActiveFunctionPlugin(Star):
             logger.debug("[ActiveFunction] Cannot get bot instance for poke action")
             return
 
-        # Execute poke action
+        # Execute poke action: group_poke in groups, friend_poke in private.
+        # Group poke is best-effort — unsupported OneBot impls just return False.
         target_user_id = int(event.get_sender_id())
-        success = await self._poke_mgr.send_poke(bot, target_user_id)
+        gid = event.get_group_id()
+        if gid:
+            success = await self._poke_mgr.send_group_poke(
+                bot, int(gid), target_user_id
+            )
+        else:
+            success = await self._poke_mgr.send_poke(bot, target_user_id)
         if success:
             logger.info(f"[ActiveFunction] Poke sent to user {target_user_id}")
         else:
@@ -437,19 +497,27 @@ class ActiveFunctionPlugin(Star):
 
             uid = int(event.get_sender_id())
             bot_id = event.get_self_id() or ""
+            gid = event.get_group_id()
 
-            # Get recent messages to find the one we just sent
+            # Get recent messages to find the one we just sent (group vs private).
             try:
-                result = await bot.call_action(
-                    "get_friend_msg_history",
-                    user_id=uid,
-                    count=5,
-                )
+                if gid:
+                    result = await bot.call_action(
+                        "get_group_msg_history",
+                        group_id=int(gid),
+                        count=10,
+                    )
+                else:
+                    result = await bot.call_action(
+                        "get_friend_msg_history",
+                        user_id=uid,
+                        count=5,
+                    )
                 messages = result.get("messages", []) if result else []
             except Exception:
                 # API not available on this OneBot implementation
                 logger.debug(
-                    "[ActiveFunction] get_friend_msg_history not available, "
+                    "[ActiveFunction] msg history API not available, "
                     "cannot fix streaming poke tag"
                 )
                 return
@@ -490,9 +558,10 @@ class ActiveFunctionPlugin(Star):
             clean_text = re.sub(r"  +", " ", clean_text).strip()
 
             if clean_text:
-                await bot.send_private_msg(
-                    user_id=uid,
-                    message=[{"type": "text", "data": {"text": clean_text}}],
+                await self._send_msg(
+                    event,
+                    bot,
+                    [{"type": "text", "data": {"text": clean_text}}],
                 )
 
             logger.info(
@@ -520,7 +589,7 @@ class ActiveFunctionPlugin(Star):
         """
         if not isinstance(event, AiocqhttpMessageEvent):
             return
-        if event.get_group_id():
+        if self._scene_disabled(event):
             return
         # Skip if already handled by streaming poke fix
         if event.get_extra("_recall_handled"):
@@ -645,7 +714,6 @@ class ActiveFunctionPlugin(Star):
         Non-Plain components are sent in their original position in the chain.
         """
         bot = event.bot
-        uid = event.get_sender_id()
         sent_count = 0
 
         for chunk in ordered_chunks:
@@ -672,10 +740,7 @@ class ActiveFunctionPlugin(Star):
                     message.append({"type": "text", "data": {"text": segment.text}})
 
                     try:
-                        send_result = await bot.send_private_msg(
-                            user_id=int(uid),
-                            message=message,
-                        )
+                        send_result = await self._send_msg(event, bot, message)
                     except Exception as e:
                         logger.error(
                             f"[ActiveFunction] Failed to send reply segment: {e}"
@@ -702,11 +767,11 @@ class ActiveFunctionPlugin(Star):
                     await asyncio.sleep(self.segment_interval)
 
                 if isinstance(chunk, Record):
-                    await self._send_record_component(bot, int(uid), chunk)
+                    await self._send_record_component(event, bot, chunk)
                 else:
                     try:
                         msg_dict = chunk.toDict()
-                        await bot.send_private_msg(user_id=int(uid), message=[msg_dict])
+                        await self._send_msg(event, bot, [msg_dict])
                     except Exception as e:
                         logger.debug(
                             f"[ActiveFunction] Skipped non-Plain component: {e}"
@@ -714,22 +779,25 @@ class ActiveFunctionPlugin(Star):
 
                 sent_count += 1
 
-    async def _send_record_component(self, bot, user_id: int, record: Record) -> None:
-        """Send a Record (voice) component via OneBot API."""
+    async def _send_record_component(
+        self, event: AiocqhttpMessageEvent, bot, record: Record
+    ) -> None:
+        """Send a Record (voice) component via OneBot API (group or private)."""
         try:
             # Convert Record to base64 format for sending (same as aiocqhttp platform)
             bs64 = await record.convert_to_base64()
             message = [{"type": "record", "data": {"file": f"base64://{bs64}"}}]
-            await bot.send_private_msg(user_id=user_id, message=message)
-            logger.info(f"[ActiveFunction] Sent voice message to user {user_id}")
+            await self._send_msg(event, bot, message)
+            logger.info("[ActiveFunction] Sent voice message")
         except Exception as e:
             logger.error(f"[ActiveFunction] Failed to send voice: {e}")
             # Fallback: send the text content if available
             if record.text:
                 try:
-                    await bot.send_private_msg(
-                        user_id=user_id,
-                        message=[{"type": "text", "data": {"text": record.text}}],
+                    await self._send_msg(
+                        event,
+                        bot,
+                        [{"type": "text", "data": {"text": record.text}}],
                     )
                 except Exception:
                     pass
@@ -857,7 +925,7 @@ class ActiveFunctionPlugin(Star):
         """
         if not isinstance(event, AiocqhttpMessageEvent):
             return
-        if event.get_group_id():
+        if self._scene_disabled(event):
             return
 
         text = response.completion_text if response else ""
@@ -952,7 +1020,7 @@ class ActiveFunctionPlugin(Star):
 
         if not isinstance(event, AiocqhttpMessageEvent):
             return
-        if event.get_group_id():
+        if self._scene_disabled(event):
             return
         # Skip if already handled by streaming poke fix
         if event.get_extra("_recall_handled"):
@@ -1025,7 +1093,7 @@ class ActiveFunctionPlugin(Star):
             return
         if not isinstance(event, AiocqhttpMessageEvent):
             return
-        if event.get_group_id():
+        if self._scene_disabled(event):
             return
 
         # Skip if already handled by on_decorating_result
@@ -1073,7 +1141,6 @@ class ActiveFunctionPlugin(Star):
             f"{[s[:30] for s in segments]}"
         )
         bot = event.bot
-        uid = event.get_sender_id()
 
         for i, segment in enumerate(segments):
             # Check if this segment starts with the recall tag (after stripping)
@@ -1085,11 +1152,12 @@ class ActiveFunctionPlugin(Star):
             if not display_text:
                 continue
 
-            # Send via bot API to get message_id
+            # Send via bot API to get message_id (group or private)
             try:
-                send_result = await bot.send_private_msg(
-                    user_id=int(uid),
-                    message=[{"type": "text", "data": {"text": display_text}}],
+                send_result = await self._send_msg(
+                    event,
+                    bot,
+                    [{"type": "text", "data": {"text": display_text}}],
                 )
             except Exception as e:
                 logger.error(f"[ActiveFunction] Failed to send segment: {e}")
