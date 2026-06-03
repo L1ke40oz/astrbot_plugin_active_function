@@ -91,13 +91,17 @@ class ActiveFunctionPlugin(Star):
         poke_cfg = config.get("poke", {})
         self.poke_enable: bool = poke_cfg.get("enable", True)
         self.poke_tag: str = poke_cfg.get("poke_tag", "[poke]")
+        # Keep the reply manager's poke tag in sync so per-segment parsing can
+        # detect and honour [poke] at the position it appears.
+        self._reply_mgr.poke_tag = self.poke_tag
         self.poke_prompt_template: str = prompt_cfg.get(
             "poke_prompt",
             "你可以在回复中使用 {poke_tag} 标签来戳对方。"
             "当你想表达亲昵、调皮、或者引起对方注意时可以使用它。"
-            "标签可以放在回复文本的任意位置，系统会在发送该段消息后执行戳一戳动作。"
-            '示例："陪我玩一会 {poke_tag}"。'
-            "注意：每条回复最多使用一次 {poke_tag}。",
+            "标签可以放在回复文本的任意位置：系统会在发送到该标签所在的那一段消息之后，"
+            "立即执行戳一戳动作，因此你可以把它放在某句话之后，在对话进行到一半时戳对方。"
+            "若开启了分段发送，戳一戳会出现在它所在分段的位置；一条回复里可以使用多次。"
+            '示例："等你好久啦{poke_tag}……快点嘛"。',
         )
 
         # Initialize poke manager
@@ -399,58 +403,108 @@ class ActiveFunctionPlugin(Star):
         if not result or not result.chain:
             return
 
-        # Use original text from on_llm_response if available (tags were stripped for history)
+        # Resolve a text source that still contains the tags: prefer the original
+        # (pre-strip) LLM text so [poke] positions are preserved, else the chain.
         original_text = event.get_extra("_active_func_original_text")
-        if original_text and self.poke_tag in original_text:
-            has_poke = True
+        if original_text:
+            text_src = original_text
         else:
-            # Fallback: get plain text from chain
-            full_text = ""
-            for comp in result.chain:
-                if isinstance(comp, Plain):
-                    full_text += comp.text
-            has_poke = self._poke_mgr.has_poke_tag(full_text)
+            text_src = "".join(
+                comp.text for comp in result.chain if isinstance(comp, Plain)
+            )
 
-        if not has_poke:
+        if not self._poke_mgr.has_poke_tag(text_src):
             return
 
-        # Always strip [poke] tags from text to prevent leaking to users
-        for i, comp in enumerate(result.chain):
-            if isinstance(comp, Plain) and self.poke_tag in comp.text:
-                result.chain[i] = Plain(comp.text.replace(self.poke_tag, ""))
+        def _strip_poke_from_chain() -> None:
+            for i, comp in enumerate(result.chain):
+                if isinstance(comp, Plain) and self.poke_tag in comp.text:
+                    result.chain[i] = Plain(comp.text.replace(self.poke_tag, ""))
 
-        # In streaming mode, the message was already sent with [poke] in it.
-        # We need to recall it and re-send without the tag.
         is_streaming = (
             result.result_content_type == ResultContentType.STREAMING_FINISH
             if hasattr(result, "result_content_type")
             else False
         )
-        if is_streaming and isinstance(event, AiocqhttpMessageEvent):
-            # Schedule recall of the streamed message and re-send without [poke]
-            await self._fix_streaming_poke(event, original_text or "")
-            # Mark as handled so reply/recall handlers don't double-process
-            event.set_extra("_recall_handled", True)
 
-        # If poke is disabled, just strip the tag and return
+        # Streaming mode: content was already streamed out with [poke] inside, so
+        # we cannot intersperse the poke. Recall + re-send the cleaned text, then
+        # fire a single poke at the end (legacy behaviour).
+        if is_streaming and isinstance(event, AiocqhttpMessageEvent):
+            _strip_poke_from_chain()
+            await self._fix_streaming_poke(event, original_text or "")
+            event.set_extra("_recall_handled", True)
+            if self.poke_enable:
+                bot = getattr(event, "bot", None) or self._get_bot_from_platform(event)
+                if bot is not None:
+                    await self._fire_poke(event, bot)
+            return
+
+        # Proactive / non-aiocqhttp events: we cannot take over segmented sending,
+        # so strip the tag and fire a single poke (legacy behaviour).
+        if not isinstance(event, AiocqhttpMessageEvent):
+            _strip_poke_from_chain()
+            if self.poke_enable:
+                bot = getattr(event, "bot", None) or self._get_bot_from_platform(event)
+                if bot is not None:
+                    await self._fire_poke(event, bot)
+            return
+
+        # Non-streaming aiocqhttp. The poke must fire at its [poke] position, which
+        # means whoever sends the segments fires it:
+        #   * reply or recall active -> that handler takes over and fires per-segment
+        #     (leave [poke] in the text for it; do NOT strip the chain).
+        #   * poke active but reply/recall not -> WE take over and send segment by
+        #     segment so the poke lands in position.
+        #   * nothing active -> strip [poke] from the chain so it does not leak.
+        has_reply = bool(re.search(r"\[reply:\d+\]", text_src))
+        has_recall = bool(self.recall_tag) and self.recall_tag in text_src
+        if (has_reply and self.reply_enable) or (has_recall and self.recall_enable):
+            return
+
         if not self.poke_enable:
+            _strip_poke_from_chain()
             logger.debug("[ActiveFunction] Poke disabled, stripped tag from output")
             return
 
-        logger.info("[ActiveFunction] on_decorating_result: handling poke tag")
+        logger.info(
+            "[ActiveFunction] on_decorating_result: handling poke (positional)"
+        )
 
-        # Get bot instance: try event.bot first, then fall back to platform instance
-        bot = getattr(event, "bot", None)
-        if bot is None:
-            bot = self._get_bot_from_platform(event)
+        # Build ordered chunks and take over sending so the poke lands in position.
+        ordered_chunks = self._build_takeover_chunks(result, original_text)
+        # reply/recall are inactive here; if their (disabled) tags are present,
+        # strip them so the takeover sender does not honour a disabled feature.
+        cleaned_chunks: list = []
+        for chunk in ordered_chunks:
+            if isinstance(chunk, str):
+                t = chunk
+                if not self.reply_enable:
+                    t = re.sub(r"\[reply:\d+\]", "", t)
+                if not self.recall_enable and self.recall_tag:
+                    t = t.replace(self.recall_tag, "")
+                cleaned_chunks.append(t)
+            else:
+                cleaned_chunks.append(chunk)
 
-        if bot is None:
-            logger.debug("[ActiveFunction] Cannot get bot instance for poke action")
+        await self._send_reply_segments_ordered(
+            event, cleaned_chunks, event.unified_msg_origin
+        )
+        event.clear_result()
+        event._has_send_oper = True
+        event.set_extra("_recall_handled", True)
+
+    async def _fire_poke(self, event: AstrMessageEvent, bot) -> None:
+        """Execute a poke at the current point in sending.
+
+        Uses ``group_poke`` in group chats and ``friend_poke`` in private. This
+        is best-effort: unsupported OneBot implementations / failures are
+        swallowed by the poke manager and simply never surface to the user.
+        """
+        try:
+            target_user_id = int(event.get_sender_id())
+        except (TypeError, ValueError):
             return
-
-        # Execute poke action: group_poke in groups, friend_poke in private.
-        # Group poke is best-effort — unsupported OneBot impls just return False.
-        target_user_id = int(event.get_sender_id())
         gid = event.get_group_id()
         if gid:
             success = await self._poke_mgr.send_group_poke(
@@ -462,8 +516,40 @@ class ActiveFunctionPlugin(Star):
             logger.info(f"[ActiveFunction] Poke sent to user {target_user_id}")
         else:
             logger.debug(
-                f"[ActiveFunction] Poke action failed for user {target_user_id}"
+                f"[ActiveFunction] Poke action failed/skipped for {target_user_id}"
             )
+
+    def _build_takeover_chunks(self, result, original_text: str | None) -> list:
+        """Build an ordered list of chunks for a segmented takeover send.
+
+        Each element is either a text ``str`` (which may still contain
+        [reply:ID]/[recall]/[poke] tags, acted on per-segment downstream) or a
+        non-Plain component (e.g. a Record from the TTS plugin) kept in position.
+        ``<tts>...</tts>`` markers are stripped from text since the TTS plugin
+        already converted them into Record components in the chain.
+        """
+        ordered_chunks: list = []
+        if original_text:
+            text = re.sub(r"<tts>.*?</tts>", "", original_text, flags=re.DOTALL)
+            text = re.sub(r"  +", " ", text).strip()
+            if text:
+                ordered_chunks.append(text)
+            for comp in result.chain:
+                if not isinstance(comp, Plain):
+                    ordered_chunks.append(comp)
+        else:
+            current_text = ""
+            for comp in result.chain:
+                if isinstance(comp, Plain):
+                    current_text += comp.text
+                else:
+                    if current_text:
+                        ordered_chunks.append(current_text)
+                        current_text = ""
+                    ordered_chunks.append(comp)
+            if current_text:
+                ordered_chunks.append(current_text)
+        return ordered_chunks
 
     def _get_bot_from_platform(self, event: AstrMessageEvent):
         """Get bot instance from platform adapter (for proactive messages)."""
@@ -632,13 +718,14 @@ class ActiveFunctionPlugin(Star):
         #
         # When original_text is available (tags were stripped for history saving),
         # we use it as the text source instead of the chain's cleaned text.
-        # We must strip [poke] from it since the poke handler already executed the action.
-        # We must also strip <tts>...</tts> tags since the TTS plugin (priority 13)
-        # already processed them into Record components in the chain.
+        # [poke] is kept in the text so it can be fired per-segment below; we only
+        # strip <tts>...</tts> tags since the TTS plugin (priority 13) already
+        # processed them into Record components in the chain.
         ordered_chunks: list[str | BaseMessageComponent] = []
         if original_text and re.search(r"\[reply:\d+\]", original_text):
-            # Use original text with reply tags; strip [poke] since it's already handled
-            text_for_reply = original_text.replace(self.poke_tag, "")
+            # Use original text with reply tags; keep [poke] so the segmented
+            # sender below can fire it at the position it appears.
+            text_for_reply = original_text
             # Strip <tts>...</tts> tags — TTS plugin already converted them to Record
             # components which are preserved as non-Plain in the chain below.
             # Keep only the text outside the tags; the TTS audio is sent via Record.
@@ -680,7 +767,8 @@ class ActiveFunctionPlugin(Star):
             new_chain = []
             for chunk in ordered_chunks:
                 if isinstance(chunk, str):
-                    cleaned = re.sub(r"\[reply:\d+\]", "", chunk).strip()
+                    cleaned = re.sub(r"\[reply:\d+\]", "", chunk)
+                    cleaned = cleaned.replace(self.poke_tag, "").strip()
                     if cleaned:
                         new_chain.append(Plain(cleaned))
                 else:
@@ -722,6 +810,9 @@ class ActiveFunctionPlugin(Star):
                 segments = self._reply_mgr.parse_segments(chunk, session_key)
                 for segment in segments:
                     if not segment.text:
+                        # A bare [poke] segment: fire the poke, send nothing.
+                        if segment.should_poke and self.poke_enable:
+                            await self._fire_poke(event, bot)
                         continue
 
                     # Interval between messages
@@ -761,6 +852,10 @@ class ActiveFunctionPlugin(Star):
                             logger.info(
                                 f"[ActiveFunction] Reply+Recall scheduled: msg_id={message_id}"
                             )
+
+                    # Fire poke right after this segment, if tagged.
+                    if segment.should_poke and self.poke_enable:
+                        await self._fire_poke(event, bot)
             else:
                 # Non-Plain component (e.g. Record from TTS plugin)
                 if sent_count > 0:
@@ -1029,8 +1124,8 @@ class ActiveFunctionPlugin(Star):
         # Use original text from on_llm_response if available (tags were stripped for history)
         original_text = event.get_extra("_active_func_original_text")
         if original_text and self.recall_tag in original_text:
-            # Strip [poke] since poke handler already executed the action
-            full_text = original_text.replace(self.poke_tag, "")
+            # Keep [poke] so it can be fired in position by _send_with_recall.
+            full_text = original_text
             # Strip <tts>...</tts> tags — TTS plugin already converted them to Record
             # components; sending raw tags as text would leak them to the user.
             full_text = re.sub(r"<tts>.*?</tts>", "", full_text, flags=re.DOTALL)
@@ -1145,11 +1240,19 @@ class ActiveFunctionPlugin(Star):
         for i, segment in enumerate(segments):
             # Check if this segment starts with the recall tag (after stripping)
             needs_recall = segment.startswith(self.recall_tag)
-            # Remove the recall tag and [NEXT] tag from displayed text
+            # Remove the recall tag from displayed text
             display_text = segment.removeprefix(self.recall_tag).strip()
+            # Detect and strip the poke tag (fired right after this segment sends)
+            seg_has_poke = bool(self.poke_tag) and self.poke_tag in display_text
+            if seg_has_poke:
+                display_text = display_text.replace(self.poke_tag, "").strip()
+            # Remove [NEXT] tag from displayed text
             display_text = _NEXT_TAG_PATTERN.sub("", display_text).strip()
 
             if not display_text:
+                # A bare [poke] segment: fire the poke, send nothing.
+                if seg_has_poke and self.poke_enable:
+                    await self._fire_poke(event, bot)
                 continue
 
             # Send via bot API to get message_id (group or private)
@@ -1176,6 +1279,10 @@ class ActiveFunctionPlugin(Star):
                         f"[ActiveFunction] Recall scheduled: msg_id={message_id}, "
                         f"delay={self.recall_delay}s"
                     )
+
+            # Fire poke right after this segment, if tagged.
+            if seg_has_poke and self.poke_enable:
+                await self._fire_poke(event, bot)
 
             # Interval between segments
             if i < len(segments) - 1:
