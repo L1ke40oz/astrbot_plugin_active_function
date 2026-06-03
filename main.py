@@ -135,6 +135,52 @@ class ActiveFunctionPlugin(Star):
         # Precompiled pattern matching any control tag (for strip/annotate).
         self._reply_tag_re = re.compile(r"\[reply:(\d+)\]")
 
+        # Precompiled patterns that match the (customizable) annotate summary
+        # templates. In annotate mode the summaries are injected into the LLM
+        # context as history; the model sometimes mimics them and emits the
+        # summary text verbatim in a new reply. Those leaked summaries carry no
+        # real control tag, so the action handlers ignore them and they reach
+        # the user. We strip them from the outgoing message (silent failure).
+        self._summary_res = [
+            self._compile_summary_pattern(t)
+            for t in (
+                self.annotate_reply_template,
+                self.annotate_recall_template,
+                self.annotate_poke_template,
+            )
+        ]
+        self._summary_res = [r for r in self._summary_res if r is not None]
+
+    @staticmethod
+    def _compile_summary_pattern(template: str):
+        """Build a regex that matches an annotate summary template.
+
+        ``{quote}`` / ``{id}`` placeholders become non-greedy wildcards so the
+        rendered summary (with arbitrary quoted content) is matched. Returns
+        None for empty templates.
+        """
+        if not template or not template.strip():
+            return None
+        sentinel = "\x00"
+        tmp = template.replace("{quote}", sentinel).replace("{id}", sentinel)
+        escaped = re.escape(tmp).replace(re.escape(sentinel), ".*?")
+        try:
+            return re.compile(escaped, re.DOTALL)
+        except re.error:
+            return None
+
+    def _strip_leaked_summaries(self, text: str) -> str:
+        """Remove any annotate summary templates the model echoed into output."""
+        if not text or not self._summary_res:
+            return text
+        cleaned = text
+        for pat in self._summary_res:
+            cleaned = pat.sub("", cleaned)
+        # Collapse whitespace left behind by removed summaries.
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
+
     async def initialize(self):
         """Plugin initialization."""
         logger.info(
@@ -422,6 +468,46 @@ class ActiveFunctionPlugin(Star):
         )
 
     # ==================== Poke: on_decorating_result ====================
+
+    @filter.on_decorating_result(priority=15)
+    async def strip_leaked_summaries_decorate(self, event: AstrMessageEvent):
+        """Strip annotate summary text the model echoed into its reply.
+
+        Runs before the poke/reply/recall handlers (priority 12/11/10) so the
+        cleaned text flows into them. Only active in ``annotate`` mode, since
+        that is the only mode that feeds summaries into the LLM context (and
+        thus the only one that can induce the model to mimic them). Real
+        ``[reply:ID]`` / ``[recall]`` / ``[poke]`` tags are untouched — the
+        summary patterns never match them.
+        """
+        if self.history_tag_mode != "annotate" or not self._summary_res:
+            return
+        if await self._disabled(event):
+            return
+
+        result = event.get_result()
+        if not result or not result.chain:
+            return
+
+        # Clean the stashed original text used by the reply/poke takeover paths.
+        original_text = event.get_extra("_active_func_original_text")
+        if original_text:
+            event.set_extra(
+                "_active_func_original_text",
+                self._strip_leaked_summaries(original_text),
+            )
+        recall_full = event.get_extra("_recall_full_text")
+        if recall_full:
+            event.set_extra(
+                "_recall_full_text", self._strip_leaked_summaries(recall_full)
+            )
+
+        # Clean the outgoing chain (covers the normal, non-takeover send path).
+        for i, comp in enumerate(result.chain):
+            if isinstance(comp, Plain):
+                cleaned = self._strip_leaked_summaries(comp.text)
+                if cleaned != comp.text:
+                    result.chain[i] = Plain(cleaned)
 
     @filter.on_decorating_result(priority=12)
     async def handle_poke_decorate(self, event: AstrMessageEvent):
@@ -1028,8 +1114,15 @@ class ActiveFunctionPlugin(Star):
         # annotate
         def _reply_repl(match: re.Match) -> str:
             rid = int(match.group(1))
-            quote = self._reply_mgr.get_cached_text(session_key, rid) or ""
-            quote = quote.replace("\n", " ").strip()
+            cached = self._reply_mgr.get_cached_text(session_key, rid)
+            if not cached:
+                # The referenced message is not (or no longer) in the cache, so
+                # the quote never resolved — i.e. the reply effectively failed.
+                # Do NOT emit a hollow "（引用了「」）" summary: it is useless to
+                # the model and, once in history, the model tends to mimic it
+                # and leak the literal summary text to users. Strip it instead.
+                return ""
+            quote = cached.replace("\n", " ").strip()
             if len(quote) > 30:
                 quote = quote[:30] + "…"
             try:
