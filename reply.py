@@ -34,6 +34,10 @@ class ReplySegment:
     text: str
     reply_message_id: int | None = None
     should_recall: bool = False
+    # When True, a poke action should be fired right after this segment is sent.
+    # A segment may carry should_poke with empty text (a [poke] on its own line),
+    # in which case only the poke fires and no message is sent for it.
+    should_poke: bool = False
 
 
 class ReplyManager:
@@ -46,12 +50,14 @@ class ReplyManager:
         prompt_template: str = "",
         recall_tag: str = "[recall]",
         segment_separator: str = "",
+        poke_tag: str = "[poke]",
     ):
         self.cache_ttl = max(1, min(cache_ttl, 86400))
         self.cache_max = max(1, min(cache_max_per_session, 500))
         self.prompt_template = prompt_template
         self.recall_tag = recall_tag
         self.segment_separator = segment_separator
+        self.poke_tag = poke_tag
 
         self._cache: dict[str, deque[CachedMessage]] = {}
         self._reply_tag_pattern = re.compile(r"\[reply:(\d+)\]")
@@ -196,12 +202,14 @@ class ReplyManager:
                     sub_segments = self._split_by_separator(leading)
                     for sub in sub_segments:
                         seg_text, should_recall = self._strip_recall_tag(sub)
-                        if seg_text:
+                        seg_text, should_poke = self._strip_poke_tag(seg_text)
+                        if seg_text or should_poke:
                             segments.append(
                                 ReplySegment(
                                     text=seg_text,
                                     reply_message_id=None,
-                                    should_recall=should_recall,
+                                    should_recall=should_recall and bool(seg_text),
+                                    should_poke=should_poke,
                                 )
                             )
                 i += 1
@@ -223,15 +231,17 @@ class ReplyManager:
                     sub_segments = self._split_by_separator(reply_text)
                     for idx, sub in enumerate(sub_segments):
                         seg_text, should_recall = self._strip_recall_tag(sub)
-                        if seg_text:
+                        seg_text, should_poke = self._strip_poke_tag(seg_text)
+                        if seg_text or should_poke:
                             segments.append(
                                 ReplySegment(
                                     text=seg_text,
                                     # Only the first sub-segment gets the Reply component
                                     reply_message_id=(target_id if valid_id else None)
-                                    if idx == 0
+                                    if idx == 0 and seg_text
                                     else None,
-                                    should_recall=should_recall,
+                                    should_recall=should_recall and bool(seg_text),
+                                    should_poke=should_poke,
                                 )
                             )
                 i += 2
@@ -282,6 +292,16 @@ class ReplyManager:
             if item.message_id == message_id:
                 return item.text
         return None
+
+    def _strip_poke_tag(self, text: str) -> tuple[str, bool]:
+        """Strip the poke tag from text and return (cleaned_text, had_poke).
+
+        Used so a [poke] tag is honoured at the position it appears in the LLM
+        output: the segment it sits in is sent first, then the poke fires.
+        """
+        if not self.poke_tag or self.poke_tag not in text:
+            return text, False
+        return text.replace(self.poke_tag, "").strip(), True
 
     def _strip_recall_tag(self, text: str) -> tuple[str, bool]:
         """Strip recall tag and [NEXT] wakeup tag from text and return (cleaned_text, should_recall)."""
