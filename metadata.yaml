@@ -4,3 +4,5 @@ desc: 为 Bot 提供主动能力：撤回消息、引用回复、戳一戳等
 version: v2.1.0
 author: L1ke40oz
 repo: "https://github.com/L1ke40oz/astrbot_plugin_active_function"
+support_platforms:
+  - aiocqhttp
