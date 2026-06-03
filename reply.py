@@ -23,6 +23,7 @@ class CachedMessage:
 
     message_id: int
     text: str  # Display text for prompt (may include media placeholders like [图片])
+    sender: str = ""  # Optional sender label (used in group chats to disambiguate)
     timestamp: float = field(default_factory=time.time)
 
 
@@ -90,8 +91,14 @@ class ReplyManager:
 
         return None
 
-    def cache_message(self, session_key: str, message_id: int, text: str) -> None:
-        """Add a message to the reply cache with TTL eviction."""
+    def cache_message(
+        self, session_key: str, message_id: int, text: str, sender: str = ""
+    ) -> None:
+        """Add a message to the reply cache with TTL eviction.
+
+        ``sender`` is an optional label (e.g. ``昵称(QQ号)``) shown in the
+        quotable-message list so the LLM can tell who said what in group chats.
+        """
         text = text.strip()
         if not text:
             return
@@ -110,7 +117,12 @@ class ReplyManager:
                 return
 
         queue.append(
-            CachedMessage(message_id=message_id, text=text, timestamp=time.time())
+            CachedMessage(
+                message_id=message_id,
+                text=text,
+                sender=sender.strip(),
+                timestamp=time.time(),
+            )
         )
         logger.debug(
             f"[ActiveFunction] Reply cache: stored mid={message_id}, text={text[:40]}"
@@ -147,7 +159,10 @@ class ReplyManager:
         lines = []
         for item in queue:
             truncated = item.text[:100] + ("..." if len(item.text) > 100 else "")
-            lines.append(f"[{item.message_id}] {truncated}")
+            if item.sender:
+                lines.append(f"[{item.message_id}] {item.sender}：{truncated}")
+            else:
+                lines.append(f"[{item.message_id}] {truncated}")
         return "\n".join(lines)
 
     # ==================== Reply Tag Parsing ====================

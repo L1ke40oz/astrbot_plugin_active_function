@@ -16,10 +16,23 @@
         },
         "default": 1.5
     },
+    "group": {
+        "description": "【群聊支持】",
+        "type": "object",
+        "hint": "总开关：是否在群聊中启用撤回 / 引用回复 / 戳一戳功能。默认关闭（仅私聊生效）。开启后这三项功能（仍受各自开关控制）也会在群聊中生效。",
+        "items": {
+            "enable": {
+                "description": "在群聊中启用本插件功能",
+                "type": "bool",
+                "hint": "开启后，撤回 / 引用回复 / 戳一戳在群聊中也会生效（仍受各自功能开关控制）。关闭则仅私聊生效。注意：群聊戳一戳依赖 OneBot 实现支持 group_poke 接口（NapCat / LLOneBot / Lagrange 支持，原版 go-cqhttp 不支持，调用失败会静默跳过）。",
+                "default": false
+            }
+        }
+    },
     "recall": {
         "description": "【消息撤回】",
         "type": "object",
-        "hint": "Bot 可通过在回复中使用 [recall] 标签来撤回该条消息。支持分段发送场景下对单段撤回。当前仅支持 aiocqhttp 平台私聊。",
+        "hint": "Bot 可通过在回复中使用 [recall] 标签来撤回该条消息。支持分段发送场景下对单段撤回。支持 aiocqhttp 私聊；群聊需在【群聊支持】中开启总开关。",
         "items": {
             "enable": {
                 "description": "启用撤回功能",
@@ -49,7 +62,7 @@
     "reply": {
         "description": "【引用回复】",
         "type": "object",
-        "hint": "Bot 可通过 [reply:ID] 标签引用用户之前的消息进行回复。系统会在消息防抖合并前缓存每条原始消息的 ID，供 LLM 引用。当前仅支持 aiocqhttp 平台私聊。",
+        "hint": "Bot 可通过 [reply:ID] 标签引用用户之前的消息进行回复。系统会在消息防抖合并前缓存每条原始消息的 ID，供 LLM 引用。支持 aiocqhttp 私聊；群聊需在【群聊支持】中开启总开关（群聊下可引用列表会带上发言人，便于区分多人消息）。",
         "items": {
             "enable": {
                 "description": "启用引用回复功能",
@@ -74,7 +87,7 @@
     "poke": {
         "description": "【戳一戳】",
         "type": "object",
-        "hint": "用户戳 Bot 时触发 LLM 响应，Bot 也可以通过 [poke] 标签主动戳用户。当前仅支持 aiocqhttp 平台私聊。",
+        "hint": "用户戳 Bot 时触发 LLM 响应，Bot 也可以通过 [poke] 标签主动戳用户。支持 aiocqhttp 私聊；群聊需在【群聊支持】中开启总开关（群聊戳一戳依赖 OneBot 的 group_poke 接口，不支持时静默跳过）。",
         "items": {
             "enable": {
                 "description": "启用戳一戳功能",

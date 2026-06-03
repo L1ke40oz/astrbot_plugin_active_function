@@ -180,6 +180,31 @@ class PokeManager:
 
         return False
 
+    async def send_group_poke(
+        self, bot: Any, group_id: int, target_user_id: int
+    ) -> bool:
+        """Send a poke action to a user inside a group via OneBot API.
+
+        Uses the ``group_poke`` action (supported by NapCat / LLOneBot /
+        Lagrange). The original go-cqhttp does not implement it, so failures
+        are swallowed and we simply return False — the caller treats a poke as
+        best-effort and never surfaces the error to the user.
+        """
+        try:
+            if hasattr(bot, "call_action"):
+                await bot.call_action(
+                    "group_poke",
+                    group_id=group_id,
+                    user_id=target_user_id,
+                )
+                return True
+        except Exception as e:
+            logger.debug(
+                f"[ActiveFunction] Group poke action not supported / failed: {e}"
+            )
+
+        return False
+
     @property
     def poke_count(self) -> int:
         """Total number of poke events responded to."""
