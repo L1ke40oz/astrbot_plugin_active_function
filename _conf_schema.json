@@ -107,6 +107,51 @@
             }
         }
     },
+    "history": {
+        "description": "【对话历史中的标签处理】",
+        "type": "object",
+        "hint": "控制 [recall]/[reply:ID]/[poke] 标签如何写入对话历史/对话数据。注意：这只影响保存到对话记录里的文本，不影响发送给用户的消息（发送内容始终会过滤掉标签）。",
+        "items": {
+            "tag_mode": {
+                "description": "历史标签处理方式",
+                "type": "string",
+                "options": [
+                    "strip",
+                    "keep",
+                    "annotate"
+                ],
+                "hint": "strip=从历史中剥离标签（历史干净，但 AI 不知道自己引用/撤回过什么）；keep=原样保留标签（AI 能看到，但说几句就一堆标签，且可能照抄已失效的引用 ID）；annotate=把标签替换成可自定义的摘要文字（推荐：既让 AI 记得自己引用/撤回了什么，又不会污染上下文）。",
+                "default": "annotate"
+            },
+            "annotate_reply_template": {
+                "description": "引用标签摘要模板",
+                "type": "string",
+                "hint": "annotate 模式下 [reply:ID] 会被替换成这段文字写入历史。占位符：{quote}=被引用消息内容（截断 30 字，缓存过期则为空），{id}=被引用消息 ID。",
+                "default": "（引用了「{quote}」）",
+                "condition": {
+                    "tag_mode": "annotate"
+                }
+            },
+            "annotate_recall_template": {
+                "description": "撤回标签摘要模板",
+                "type": "string",
+                "hint": "annotate 模式下 [recall] 标签会被替换成这段文字（被撤回的正文仍保留在历史里，只是去掉了原始标签并加上说明）。",
+                "default": "（接下来这句已被撤回）",
+                "condition": {
+                    "tag_mode": "annotate"
+                }
+            },
+            "annotate_poke_template": {
+                "description": "戳一戳标签摘要模板",
+                "type": "string",
+                "hint": "annotate 模式下 [poke] 标签会被替换成这段文字写入历史。",
+                "default": "（戳了戳对方）",
+                "condition": {
+                    "tag_mode": "annotate"
+                }
+            }
+        }
+    },
     "prompt": {
         "description": "【提示词注入】",
         "type": "object",

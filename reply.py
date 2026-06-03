@@ -253,6 +253,21 @@ class ReplyManager:
             return False
         return any(item.message_id == message_id for item in queue)
 
+    def get_cached_text(self, session_key: str, message_id: int) -> str | None:
+        """Return the cached display text for a message_id, or None if absent/expired.
+
+        Used to render the {quote} placeholder when annotating [reply:ID] tags in
+        conversation history.
+        """
+        self._prune_cache(session_key)
+        queue = self._cache.get(session_key)
+        if not queue:
+            return None
+        for item in queue:
+            if item.message_id == message_id:
+                return item.text
+        return None
+
     def _strip_recall_tag(self, text: str) -> tuple[str, bool]:
         """Strip recall tag and [NEXT] wakeup tag from text and return (cleaned_text, should_recall)."""
         if not self.recall_tag:
