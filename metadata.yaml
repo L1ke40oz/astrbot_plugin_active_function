@@ -1,6 +1,6 @@
 name: astrbot_plugin_active_function
 display_name: OneBot主动能力
 desc: 为 Bot 提供主动能力：撤回消息、引用回复、戳一戳等
-version: v1.3.0
+version: v1.4.0
 author: L1ke40oz
 repo: "https://github.com/L1ke40oz/astrbot_plugin_active_function"

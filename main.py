@@ -101,13 +101,37 @@ class ActiveFunctionPlugin(Star):
             poke_tag=self.poke_tag,
         )
 
+        # history tag handling config
+        # How control tags ([recall]/[reply:ID]/[poke]) are represented in the
+        # SAVED conversation history (this never affects what is sent to the user;
+        # the message sent to users is always filtered in on_decorating_result).
+        #   strip    -> remove tags entirely (clean history)
+        #   keep     -> leave tags as-is (raw tags stay in history)
+        #   annotate -> replace each tag with a customizable summary string
+        history_cfg = config.get("history", {})
+        self.history_tag_mode: str = history_cfg.get("tag_mode", "annotate")
+        if self.history_tag_mode not in ("strip", "keep", "annotate"):
+            self.history_tag_mode = "annotate"
+        self.annotate_reply_template: str = history_cfg.get(
+            "annotate_reply_template", "（引用了「{quote}」）"
+        )
+        self.annotate_recall_template: str = history_cfg.get(
+            "annotate_recall_template", "（接下来这句已被撤回）"
+        )
+        self.annotate_poke_template: str = history_cfg.get(
+            "annotate_poke_template", "（戳了戳对方）"
+        )
+        # Precompiled pattern matching any control tag (for strip/annotate).
+        self._reply_tag_re = re.compile(r"\[reply:(\d+)\]")
+
     async def initialize(self):
         """Plugin initialization."""
         logger.info(
             f"[ActiveFunction] Initialized. Recall enabled={self.recall_enable}, "
             f"delay={self.recall_delay}s, tag='{self.recall_tag}'. "
             f"Reply enabled={self.reply_enable}. "
-            f"Poke enabled={self.poke_enable}, tag='{self.poke_tag}'."
+            f"Poke enabled={self.poke_enable}, tag='{self.poke_tag}'. "
+            f"History tag mode='{self.history_tag_mode}'."
         )
 
     async def terminate(self):
@@ -716,10 +740,11 @@ class ActiveFunctionPlugin(Star):
     async def inject_prompt(self, event: AstrMessageEvent, request: ProviderRequest):
         """Inject function usage instructions into the LLM system prompt.
 
-        Control tags ([recall], [reply:ID], [poke]) are intentionally NOT
-        stripped from the conversation history here: they are kept in the saved
-        conversation data and remain visible to the LLM in its context, while
-        only the message sent to the user is filtered (in on_decorating_result).
+        Also applies the configured history tag mode to the conversation
+        context that is about to be sent to the LLM, so that pre-existing raw
+        tags in older history are handled consistently (strip removes them,
+        annotate rewrites them into summaries, keep leaves them untouched).
+        This only mutates the in-flight request context, not the stored history.
         """
         if not self.prompt_enable:
             return
@@ -727,22 +752,108 @@ class ActiveFunctionPlugin(Star):
         if suffix:
             request.system_prompt += "\n\n" + suffix
 
+        if self.history_tag_mode != "keep":
+            self._apply_history_mode_to_contexts(request, event.unified_msg_origin)
+
+    def _apply_history_mode_to_contexts(self, request: ProviderRequest, session_key: str):
+        """Rewrite control tags in assistant history messages per history_tag_mode.
+
+        Only relevant for ``strip`` and ``annotate``; ``keep`` is a no-op and
+        never calls this. Mutates the request contexts in place (in-flight only).
+        """
+        if not request.contexts:
+            return
+
+        for ctx in request.contexts:
+            if not isinstance(ctx, dict):
+                continue
+            if ctx.get("role") != "assistant":
+                continue
+
+            content = ctx.get("content")
+            if isinstance(content, str):
+                if self._has_control_tag(content):
+                    ctx["content"] = self._transform_history_text(content, session_key)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text = part.get("text", "")
+                        if self._has_control_tag(text):
+                            part["text"] = self._transform_history_text(
+                                text, session_key
+                            )
+
+    def _has_control_tag(self, text: str) -> bool:
+        """Whether the text contains any [recall]/[reply:ID]/[poke] control tag."""
+        return (
+            (bool(self.recall_tag) and self.recall_tag in text)
+            or (bool(self.poke_tag) and self.poke_tag in text)
+            or bool(self._reply_tag_re.search(text))
+        )
+
+    def _transform_history_text(self, text: str, session_key: str) -> str:
+        """Transform control tags in a text for conversation-history representation.
+
+        Honors ``history_tag_mode``:
+          - ``keep``     -> returned unchanged
+          - ``strip``    -> all control tags removed
+          - ``annotate`` -> each tag replaced by its (customizable) summary string
+
+        Never used for the message that is actually sent to the user.
+        """
+        mode = self.history_tag_mode
+        if mode == "keep":
+            return text
+
+        if mode == "strip":
+            cleaned = text
+            if self.recall_tag:
+                cleaned = cleaned.replace(self.recall_tag, "")
+            if self.poke_tag:
+                cleaned = cleaned.replace(self.poke_tag, "")
+            cleaned = self._reply_tag_re.sub("", cleaned)
+            return re.sub(r"  +", " ", cleaned).strip()
+
+        # annotate
+        def _reply_repl(match: re.Match) -> str:
+            rid = int(match.group(1))
+            quote = self._reply_mgr.get_cached_text(session_key, rid) or ""
+            quote = quote.replace("\n", " ").strip()
+            if len(quote) > 30:
+                quote = quote[:30] + "…"
+            try:
+                return self.annotate_reply_template.format(quote=quote, id=rid)
+            except (KeyError, IndexError, ValueError):
+                # User template has unexpected placeholders/braces; use as-is.
+                return self.annotate_reply_template
+
+        annotated = self._reply_tag_re.sub(_reply_repl, text)
+        if self.recall_tag:
+            annotated = annotated.replace(self.recall_tag, self.annotate_recall_template)
+        if self.poke_tag:
+            annotated = annotated.replace(self.poke_tag, self.annotate_poke_template)
+        return re.sub(r"  +", " ", annotated).strip()
+
     # ==================== LLM Response Hook ====================
 
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, response: LLMResponse):
-        """When LLM responds, record the control tags for the sending stage.
+        """When LLM responds, prepare both the sending stage and saved history.
 
-        We only stash the original text (with tags) in event extras so the
+        We always stash the original text (with raw tags) in event extras so the
         on_decorating_result handlers can execute the corresponding actions
-        (poke / reply / recall) and filter the tags out of what is actually
-        sent to the user.
+        (poke / reply / recall) and filter the tags out of what is actually sent
+        to the user. The message sent to users is therefore unaffected by the
+        history tag mode.
 
-        We intentionally do NOT strip the tags from response.completion_text
-        or from the assistant message in run_context.messages: the control
-        tags must remain visible in the saved conversation data. Filtering
-        only happens later in on_decorating_result, so users never see the
-        tags even though the conversation history keeps them.
+        For the SAVED conversation history we apply ``history_tag_mode``:
+          - ``keep``     -> leave completion_text / run_context untouched (raw tags)
+          - ``strip``    -> remove tags from the persisted assistant message
+          - ``annotate`` -> rewrite tags into summary strings in the persisted message
+
+        We deliberately do NOT touch response.result_chain here: that chain feeds
+        the outgoing message, and the on_decorating_result handlers rely on the
+        raw tags still being present to clean the output correctly.
         """
         if not isinstance(event, AiocqhttpMessageEvent):
             return
@@ -761,21 +872,69 @@ class ActiveFunctionPlugin(Star):
         if not has_recall and not has_poke and not has_reply:
             return
 
-        # Stash original text (with tags) for the on_decorating_result handlers.
-        # The tags are intentionally left in completion_text / run_context so they
-        # remain in the saved conversation history; only the message sent to the
-        # user is filtered (later, in on_decorating_result).
+        # Stash the raw text (with tags) for the on_decorating_result handlers.
         event.set_extra("_active_func_original_text", text)
 
         if has_recall:
             event.set_extra("_recall_pending", True)
             event.set_extra("_recall_full_text", text)
 
+        # Apply the history tag mode to what gets persisted. "keep" leaves the
+        # raw tags in place (no rewrite needed).
+        if self.history_tag_mode != "keep":
+            history_text = self._transform_history_text(
+                text, event.unified_msg_origin
+            )
+            response.completion_text = history_text
+            self._patch_last_assistant_message(event, history_text)
+
         logger.info(
             "[ActiveFunction] Detected control tags in LLM response "
-            "(kept in conversation history, filtered from output). "
+            f"(history_tag_mode={self.history_tag_mode}). "
             f"recall={has_recall}, poke={has_poke}, reply={has_reply}"
         )
+
+    def _patch_last_assistant_message(self, event: AstrMessageEvent, new_text: str):
+        """Patch the last assistant message in run_context.messages with new_text.
+
+        The agent runner appends the assistant message to run_context.messages
+        BEFORE on_llm_response fires, so we rewrite its TextPart to control what
+        gets persisted to conversation history (used by strip/annotate modes).
+        """
+        try:
+            from astrbot.core.pipeline.process_stage.follow_up import (
+                _ACTIVE_AGENT_RUNNERS,
+            )
+
+            runner = _ACTIVE_AGENT_RUNNERS.get(event.unified_msg_origin)
+            if not runner or not hasattr(runner, "run_context"):
+                return
+
+            messages = runner.run_context.messages
+            if not messages:
+                return
+
+            last_msg = messages[-1]
+            if getattr(last_msg, "role", None) != "assistant":
+                return
+
+            content = getattr(last_msg, "content", None)
+            if not content:
+                return
+
+            if isinstance(content, list):
+                for part in content:
+                    if (
+                        hasattr(part, "type")
+                        and part.type == "text"
+                        and hasattr(part, "text")
+                    ):
+                        part.text = new_text
+                        break
+            elif isinstance(content, str):
+                last_msg.content = new_text
+        except Exception as e:
+            logger.debug(f"[ActiveFunction] Failed to patch assistant message: {e}")
 
     # ==================== on_decorating_result (non-streaming) ====================
 
