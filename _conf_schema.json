@@ -24,7 +24,7 @@
             "enable": {
                 "description": "在群聊中启用本插件功能",
                 "type": "bool",
-                "hint": "开启后，撤回 / 引用回复 / 戳一戳在群聊中也会生效（仍受各自功能开关控制）。关闭则仅私聊生效。注意：群聊戳一戳依赖 OneBot 实现支持 group_poke 接口（NapCat / LLOneBot / Lagrange 支持，原版 go-cqhttp 不支持，调用失败会静默跳过）。",
+                "hint": "开启后，撤回 / 引用回复 / 戳一戳在群聊中也会生效。关闭则仅私聊生效。注意：群聊戳一戳依赖 OneBot 实现支持 group_poke 接口（NapCat / LLOneBot / Lagrange 支持，原版 go-cqhttp 不支持，调用失败会静默跳过）。",
                 "default": false
             }
         }

@@ -657,12 +657,12 @@ class ActiveFunctionPlugin(Star):
         Each element is either a text ``str`` (which may still contain
         [reply:ID]/[recall]/[poke] tags, acted on per-segment downstream) or a
         non-Plain component (e.g. a Record from the TTS plugin) kept in position.
-        ``<tts>...</tts>`` markers are stripped from text since the TTS plugin
+        ``<tts>...</tts>`` 和 ``<tts:emotion>...</tts>`` 标签会从文本中剥离，因为 TTS 插件
         already converted them into Record components in the chain.
         """
         ordered_chunks: list = []
         if original_text:
-            text = re.sub(r"<tts>.*?</tts>", "", original_text, flags=re.DOTALL)
+            text = re.sub(r"<tts(?::\w+)?>.*?</tts(?::\w+)?>", "", original_text, flags=re.DOTALL)
             text = re.sub(r"  +", " ", text).strip()
             if text:
                 ordered_chunks.append(text)
@@ -772,7 +772,7 @@ class ActiveFunctionPlugin(Star):
             clean_text = original_text.replace(self.poke_tag, "")
             clean_text = clean_text.replace(self.recall_tag, "")
             clean_text = re.sub(r"\[reply:\d+\]", "", clean_text)
-            clean_text = re.sub(r"<tts>.*?</tts>", "", clean_text, flags=re.DOTALL)
+            clean_text = re.sub(r"<tts(?::\w+)?>.*?</tts(?::\w+)?>", "", clean_text, flags=re.DOTALL)
             clean_text = re.sub(r"  +", " ", clean_text).strip()
 
             if clean_text:
@@ -851,18 +851,18 @@ class ActiveFunctionPlugin(Star):
         # When original_text is available (tags were stripped for history saving),
         # we use it as the text source instead of the chain's cleaned text.
         # [poke] is kept in the text so it can be fired per-segment below; we only
-        # strip <tts>...</tts> tags since the TTS plugin (priority 13) already
+        # strip <tts>...</tts> 和 <tts:emotion>...</tts> 标签，因为 TTS 插件 (priority 13) 已经
         # processed them into Record components in the chain.
         ordered_chunks: list[str | BaseMessageComponent] = []
         if original_text and re.search(r"\[reply:\d+\]", original_text):
             # Use original text with reply tags; keep [poke] so the segmented
             # sender below can fire it at the position it appears.
             text_for_reply = original_text
-            # Strip <tts>...</tts> tags — TTS plugin already converted them to Record
+            # Strip <tts>...</tts> 和 <tts:emotion>...</tts> 或 <tts:emotion>...</tts:emotion> 标签 — TTS 插件已转换为 Record
             # components which are preserved as non-Plain in the chain below.
             # Keep only the text outside the tags; the TTS audio is sent via Record.
             text_for_reply = re.sub(
-                r"<tts>.*?</tts>", "", text_for_reply, flags=re.DOTALL
+                r"<tts(?::\w+)?>.*?</tts(?::\w+)?>", "", text_for_reply, flags=re.DOTALL
             )
             # Clean up extra whitespace left by tag removal
             text_for_reply = re.sub(r"  +", " ", text_for_reply).strip()
@@ -1267,9 +1267,9 @@ class ActiveFunctionPlugin(Star):
         if original_text and self.recall_tag in original_text:
             # Keep [poke] so it can be fired in position by _send_with_recall.
             full_text = original_text
-            # Strip <tts>...</tts> tags — TTS plugin already converted them to Record
+            # Strip <tts>...</tts> 和 <tts:emotion>...</tts> 或 <tts:emotion>...</tts:emotion> 标签 — TTS 插件已转换为 Record
             # components; sending raw tags as text would leak them to the user.
-            full_text = re.sub(r"<tts>.*?</tts>", "", full_text, flags=re.DOTALL)
+            full_text = re.sub(r"<tts(?::\w+)?>.*?</tts(?::\w+)?>", "", full_text, flags=re.DOTALL)
             full_text = re.sub(r"  +", " ", full_text).strip()
         else:
             # Fallback: get plain text from chain
