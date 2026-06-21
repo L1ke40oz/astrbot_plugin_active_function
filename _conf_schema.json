@@ -109,7 +109,7 @@
             "poke_prompt": {
                 "description": "戳一戳提示词",
                 "type": "text",
-                "hint": "用户戳 Bot 时发送给 LLM 的提示词。$username 可作为占位符替换为用户名。可自由修改戳一戳提示词后缀",
+                "hint": "用户戳 Bot 时发送给 LLM 的提示词。$username 可作为占位符替换为用户的 QQ 号。可自由修改戳一戳提示词后缀",
                 "default": "[这是一个真实的戳一戳动作] $username 戳了戳你。"
             },
             "poke_tag": {
@@ -133,23 +133,23 @@
                     "keep",
                     "annotate"
                 ],
-                "hint": "strip=从历史中剥离标签（历史干净，但 AI 不知道自己引用/撤回过什么）；keep=原样保留标签（AI 能看到原始标签，但可能污染上下文或引用过期 ID）；annotate=把标签替换成可自定义的摘要文字（让 AI 记得自己引用/撤回了什么，不会污染上下文）。",
+                "hint": "strip=从历史中剥离标签（历史干净，但 AI 不知道自己引用/撤回过什么）；keep=原样保留标签（AI 能看到原始标签，但引用过期 ID）；annotate=把标签替换成可自定义的摘要文字（让 AI 记得自己引用/撤回了什么，有概率污染上下文）。",
                 "default": "annotate"
             },
             "annotate_reply_template": {
                 "description": "引用标签摘要",
                 "type": "string",
                 "hint": "annotate 模式下 [reply:ID] 会被替换成这段文字写入历史。占位符：{quote}=被引用消息内容（截断 30 字，缓存过期则为空），{id}=被引用消息 ID。",
-                "default": "（引用了「{quote}」）",
+                "default": "【仅作提示：你引用了用户说的「{quote}」】",
                 "condition": {
-                    "tag_mode": "annotate"
+                    "tag_mode": "strip"
                 }
             },
             "annotate_recall_template": {
                 "description": "撤回标签摘要模板",
                 "type": "string",
                 "hint": "annotate 模式下 [recall] 标签会被替换成这段文字（被撤回的正文仍保留在历史里，只是去掉了原始标签并加上说明）。",
-                "default": "（接下来这句已被撤回）",
+                "default": "【仅作提示：接下来这句已被撤回】",
                 "condition": {
                     "tag_mode": "annotate"
                 }
@@ -158,7 +158,7 @@
                 "description": "戳一戳标签摘要模板",
                 "type": "string",
                 "hint": "annotate 模式下 [poke] 标签会被替换成这段文字写入历史。",
-                "default": "（戳了戳对方）",
+                "default": "【仅作提示：你戳了戳她】",
                 "condition": {
                     "tag_mode": "annotate"
                 }
