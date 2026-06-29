@@ -110,7 +110,8 @@ class ActiveFunctionPlugin(Star):
         self._poke_mgr = PokeManager(
             enable=self.poke_enable,
             cooldown=poke_cfg.get("cooldown", 5.0),
-            poke_prompt=poke_cfg.get("poke_prompt", ""),
+            poke_prompt_private=poke_cfg.get("poke_prompt_private", ""),
+            poke_prompt_group=poke_cfg.get("poke_prompt_group", ""),
             poke_tag=self.poke_tag,
         )
 
@@ -450,7 +451,9 @@ class ActiveFunctionPlugin(Star):
 
         # Inject readable text into the event so it merges with debounce
         username = event.get_sender_name() or sender_id
-        poke_text = self._poke_mgr.format_poke_injection(username)
+        userid = sender_id
+        is_group = bool(event.get_group_id())
+        poke_text = self._poke_mgr.format_poke_injection(username, userid, is_group)
         event.message_str = poke_text
         if hasattr(event.message_obj, "message_str"):
             event.message_obj.message_str = poke_text

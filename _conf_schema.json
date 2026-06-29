@@ -112,11 +112,17 @@
                 },
                 "default": 5.0
             },
-            "poke_prompt": {
-                "description": "戳一戳替换词",
+            "poke_prompt_private": {
+                "description": "戳一戳替换词（私聊）",
                 "type": "text",
-                "hint": "用户戳 Bot 时发送给 LLM 的提示词。$username 可作为占位符替换为用户名。可自由修改戳一戳提示词后缀",
+                "hint": "用户在私聊中戳 Bot 时发送给 LLM 的提示词。$username 可作为占位符替换为用户昵称",
                 "default": "[这是一个真实的戳一戳动作] $username 戳了戳你。"
+            },
+            "poke_prompt_group": {
+                "description": "戳一戳替换词（群聊）",
+                "type": "text",
+                "hint": "用户在群聊中戳 Bot 时发送给 LLM 的提示词。$userid 可替换为 QQ 号",
+                "default": "[这是一个真实的戳一戳动作] 用户 $userid 戳了戳你。"
             },
             "poke_tag": {
                 "description": "戳一戳标签",

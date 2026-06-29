@@ -1,5 +1,24 @@
 # Changelog
 
+## v2.4.0 (2026-06-29)
+
+### 新增
+- **私聊/群聊分离的戳一戳提示词**：新增 `poke_prompt_private` 和 `poke_prompt_group` 配置项
+  - 私聊默认使用用户昵称（`$username`）
+  - 群聊默认使用用户 ID（`$userid`），避免不合适的亲密称呼
+- **智能场景识别**：根据 `event.get_group_id()` 自动判断私聊/群聊场景
+
+### 改进
+- **更自然的群聊交互**：群聊中戳一戳不再出现"宝宝亲了亲你"等不适当的提示
+- **灵活占位符**：`format_poke_injection` 方法支持 `$username` 和 `$userid` 双占位符
+
+### 技术细节
+- `PokeManager.__init__` 支持两个独立的模板参数
+- `format_poke_injection` 新增 `is_group` 参数自动选择模板
+- 向后兼容：旧配置会自动使用默认值
+
+---
+
 ## v2.3.0 (2026-06-29)
 
 ### 新增
