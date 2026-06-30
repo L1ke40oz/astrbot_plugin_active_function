@@ -193,3 +193,7 @@ LLM 输出 → on_llm_response（保存原始文本到 event extra；按 history
 - AstrBot 框架
 - aiocqhttp（OneBot v11）适配器
 - 支持 `friend_poke` API 的 OneBot 实现（如 NapCat、LLOneBot）；群聊戳一戳还需支持 `group_poke`
+
+## License
+
+MIT

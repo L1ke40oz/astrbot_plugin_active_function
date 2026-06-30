@@ -48,7 +48,6 @@ class ReplyManager:
         cache_ttl: int = 600,
         cache_max_per_session: int = 50,
         prompt_template: str = "",
-        reply_tag: str = "[reply:{id}]",
         recall_tag: str = "[recall]",
         segment_separator: str = "",
         poke_tag: str = "[poke]",
@@ -56,52 +55,12 @@ class ReplyManager:
         self.cache_ttl = max(1, min(cache_ttl, 86400))
         self.cache_max = max(1, min(cache_max_per_session, 500))
         self.prompt_template = prompt_template
-        self.reply_tag = reply_tag
         self.recall_tag = recall_tag
         self.segment_separator = segment_separator
         self.poke_tag = poke_tag
 
         self._cache: dict[str, deque[CachedMessage]] = {}
-        # Build dynamic regex pattern from reply_tag config
-        self._reply_tag_pattern = self._build_reply_pattern(reply_tag)
-        # Build fallback patterns for common malformed variants (case-insensitive, negative IDs)
-        self._reply_fallback_patterns = [
-            re.compile(r'\[reply:-?\d+\]', re.IGNORECASE),
-            re.compile(r'<reply:-?\d+>', re.IGNORECASE),
-            re.compile(r'【reply:-?\d+】', re.IGNORECASE),
-            re.compile(r'\(reply:-?\d+\)', re.IGNORECASE),
-            re.compile(r'\[引用:-?\d+\]', re.IGNORECASE),
-        ]
-
-    def _build_reply_pattern(self, tag_template: str) -> re.Pattern:
-        """Build regex pattern from reply_tag template.
-        
-        Examples:
-            [reply:{id}]  -> \[reply:(\d+)\]
-            <reply:{id}>  -> <reply:(\d+)>
-            【reply:{id}】 -> 【reply:(\d+)】
-        
-        Allows negative IDs and is case-insensitive to catch common LLM mistakes.
-        """
-        if '{id}' not in tag_template:
-            logger.warning(
-                f"[ActiveFunction] Invalid reply_tag template '{tag_template}': "
-                f"missing {{id}} placeholder, falling back to [reply:(\\d+)]"
-            )
-            return re.compile(r'\[reply:(\d+)\]', re.IGNORECASE)
-        
-        try:
-            # Escape special regex characters
-            escaped = re.escape(tag_template)
-            # Replace escaped {id} with capture group for any integer (including negative)
-            pattern_str = escaped.replace(r'\{id\}', r'(-?\d+)')
-            return re.compile(pattern_str, re.IGNORECASE)
-        except re.error as e:
-            logger.warning(
-                f"[ActiveFunction] Failed to build reply_tag regex from '{tag_template}': {e}, "
-                f"falling back to [reply:(\\d+)]"
-            )
-            return re.compile(r'\[reply:(\d+)\]', re.IGNORECASE)
+        self._reply_tag_pattern = re.compile(r"\[reply:(\d+)\]")
 
     # ==================== Message Caching ====================
 
@@ -192,9 +151,7 @@ class ReplyManager:
             return ""
 
         message_list = self._build_message_list(session_key)
-        # Replace {reply_tag} with example showing actual configured format
-        example_tag = self.reply_tag.replace('{id}', 'ID')
-        prompt = self.prompt_template.replace("{reply_tag}", example_tag)
+        prompt = self.prompt_template.replace("{reply_tag}", "[reply:ID]")
         prompt = prompt.replace("{message_list}", message_list)
         return prompt
 
@@ -219,25 +176,6 @@ class ReplyManager:
     def has_reply_tags(self, text: str) -> bool:
         """Check if text contains any [reply:ID] tags."""
         return bool(self._reply_tag_pattern.search(text))
-
-    def strip_all_reply_variants(self, text: str) -> str:
-        """Strip all known reply tag variants from text (for fallback cleanup).
-        
-        This catches malformed tags that LLM might produce:
-        - Case variations: [Reply:123], [REPLY:123]
-        - Negative IDs: [reply:-123]
-        - Different brackets: <reply:123>, 【reply:123】, (reply:123)
-        - Chinese variants: [引用:123]
-        """
-        cleaned = text
-        # Strip main configured pattern
-        cleaned = self._reply_tag_pattern.sub('', cleaned)
-        # Strip common fallback variants
-        for pattern in self._reply_fallback_patterns:
-            cleaned = pattern.sub('', cleaned)
-        # Clean up extra whitespace
-        cleaned = re.sub(r'  +', ' ', cleaned).strip()
-        return cleaned
 
     def parse_segments(self, text: str, session_key: str) -> list[ReplySegment]:
         """Parse text into ReplySegments, splitting on [reply:ID] tags.

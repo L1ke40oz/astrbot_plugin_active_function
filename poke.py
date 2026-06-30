@@ -43,8 +43,7 @@ class PokeManager:
         self,
         enable: bool = True,
         cooldown: float = 5.0,
-        poke_prompt_private: str = "",
-        poke_prompt_group: str = "",
+        poke_prompt: str = "",
         poke_tag: str = "[poke]",
     ):
         self.enable = enable
@@ -56,8 +55,7 @@ class PokeManager:
         except (ValueError, TypeError):
             self.cooldown = 5.0
 
-        self.poke_prompt_private = poke_prompt_private or DEFAULT_POKE_PROMPT
-        self.poke_prompt_group = poke_prompt_group or "[这是一个真实的戳一戳动作] 用户 $userid 戳了戳你。"
+        self.poke_prompt = poke_prompt or DEFAULT_POKE_PROMPT
 
         # Cooldown tracking: user_id -> last_poke_time
         self._cooldown_map: dict[str, float] = {}
@@ -147,17 +145,10 @@ class PokeManager:
 
     # ==================== Prompt Formatting ====================
 
-    def format_poke_injection(self, username: str, userid: str = "", is_group: bool = False) -> str:
-        """Format the poke prompt to inject into user message text.
-        
-        Args:
-            username: User nickname
-            userid: User QQ ID
-            is_group: True if in group chat, False if private chat
-        """
-        template_str = self.poke_prompt_group if is_group else self.poke_prompt_private
-        template = Template(template_str)
-        return template.safe_substitute(username=username, userid=userid)
+    def format_poke_injection(self, username: str) -> str:
+        """Format the poke prompt to inject into user message text."""
+        template = Template(self.poke_prompt)
+        return template.safe_substitute(username=username)
 
     # ==================== Poke Tag Parsing ====================
 

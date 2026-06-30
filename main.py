@@ -65,7 +65,6 @@ class ActiveFunctionPlugin(Star):
         # reply config
         reply_cfg = config.get("reply", {})
         self.reply_enable: bool = reply_cfg.get("enable", True)
-        self.reply_tag: str = reply_cfg.get("reply_tag", "[reply:{id}]")
         reply_cache_ttl: int = reply_cfg.get("cache_ttl", 600)
         reply_cache_max: int = reply_cfg.get("cache_max_per_session", 50)
         reply_prompt_template: str = prompt_cfg.get(
@@ -84,7 +83,6 @@ class ActiveFunctionPlugin(Star):
             cache_ttl=reply_cache_ttl,
             cache_max_per_session=reply_cache_max,
             prompt_template=reply_prompt_template,
-            reply_tag=self.reply_tag,
             recall_tag=self.recall_tag,
             segment_separator=self.segment_separator,
         )
@@ -110,8 +108,7 @@ class ActiveFunctionPlugin(Star):
         self._poke_mgr = PokeManager(
             enable=self.poke_enable,
             cooldown=poke_cfg.get("cooldown", 5.0),
-            poke_prompt_private=poke_cfg.get("poke_prompt_private", ""),
-            poke_prompt_group=poke_cfg.get("poke_prompt_group", ""),
+            poke_prompt=poke_cfg.get("poke_prompt", ""),
             poke_tag=self.poke_tag,
         )
 
@@ -135,6 +132,9 @@ class ActiveFunctionPlugin(Star):
         self.annotate_poke_template: str = history_cfg.get(
             "annotate_poke_template", "（戳了戳对方）"
         )
+        # Precompiled pattern matching any control tag (for strip/annotate).
+        self._reply_tag_re = re.compile(r"\[reply:(\d+)\]")
+
         # Precompiled patterns that match the (customizable) annotate summary
         # templates. In annotate mode the summaries are injected into the LLM
         # context as history; the model sometimes mimics them and emits the
@@ -186,7 +186,7 @@ class ActiveFunctionPlugin(Star):
         logger.info(
             f"[ActiveFunction] Initialized. Recall enabled={self.recall_enable}, "
             f"delay={self.recall_delay}s, tag='{self.recall_tag}'. "
-            f"Reply enabled={self.reply_enable}, tag='{self.reply_tag}'. "
+            f"Reply enabled={self.reply_enable}. "
             f"Poke enabled={self.poke_enable}, tag='{self.poke_tag}'. "
             f"History tag mode='{self.history_tag_mode}'."
         )
@@ -451,9 +451,7 @@ class ActiveFunctionPlugin(Star):
 
         # Inject readable text into the event so it merges with debounce
         username = event.get_sender_name() or sender_id
-        userid = sender_id
-        is_group = bool(event.get_group_id())
-        poke_text = self._poke_mgr.format_poke_injection(username, userid, is_group)
+        poke_text = self._poke_mgr.format_poke_injection(username)
         event.message_str = poke_text
         if hasattr(event.message_obj, "message_str"):
             event.message_obj.message_str = poke_text
@@ -1087,7 +1085,7 @@ class ActiveFunctionPlugin(Star):
         return (
             (bool(self.recall_tag) and self.recall_tag in text)
             or (bool(self.poke_tag) and self.poke_tag in text)
-            or self._reply_mgr.has_reply_tags(text)
+            or bool(self._reply_tag_re.search(text))
         )
 
     def _transform_history_text(self, text: str, session_key: str) -> str:
@@ -1110,7 +1108,7 @@ class ActiveFunctionPlugin(Star):
                 cleaned = cleaned.replace(self.recall_tag, "")
             if self.poke_tag:
                 cleaned = cleaned.replace(self.poke_tag, "")
-            cleaned = self._reply_mgr.strip_all_reply_variants(cleaned)
+            cleaned = self._reply_tag_re.sub("", cleaned)
             return re.sub(r"  +", " ", cleaned).strip()
 
         # annotate
@@ -1133,7 +1131,7 @@ class ActiveFunctionPlugin(Star):
                 # User template has unexpected placeholders/braces; use as-is.
                 return self.annotate_reply_template
 
-        annotated = self._reply_mgr._reply_tag_pattern.sub(_reply_repl, text)
+        annotated = self._reply_tag_re.sub(_reply_repl, text)
         if self.recall_tag:
             annotated = annotated.replace(self.recall_tag, self.annotate_recall_template)
         if self.poke_tag:
@@ -1465,67 +1463,6 @@ class ActiveFunctionPlugin(Star):
     # ==================== NEXT tag cleanup (fallback) ====================
 
     @filter.on_decorating_result(priority=1)
-    @filter.on_decorating_result(priority=5)
-    async def fallback_strip_control_tags(self, event: AstrMessageEvent):
-        """Fallback cleanup: strip all control tags that weren't handled by higher-priority hooks.
-
-        This catches edge cases where tags leak to users:
-        - Plugin disabled but LLM still outputs tags
-        - Malformed tags (uppercase Reply, negative IDs, wrong brackets)
-        - Non-supported platforms
-        - Session-level plugin disabled
-
-        Runs at low priority (5) after all functional handlers have finished.
-        """
-        if await self._session_inactive(event):
-            return
-        
-        # Skip if already handled by functional handlers
-        if event.get_extra("_recall_handled"):
-            return
-        
-        result = event.get_result()
-        if not result or not result.chain:
-            return
-
-        # Check if any control tags are present
-        full_text = "".join(comp.text for comp in result.chain if isinstance(comp, Plain))
-        if not full_text:
-            return
-        
-        has_tags = (
-            (self.recall_tag and self.recall_tag in full_text)
-            or (self.poke_tag and self.poke_tag in full_text)
-            or self._reply_mgr.has_reply_tags(full_text)
-        )
-        
-        if not has_tags:
-            return
-        
-        # Strip all control tag variants
-        logger.warning(
-            f"[ActiveFunction] Fallback cleanup: detected unhandled control tags, "
-            f"stripping from output. Session: {event.unified_msg_origin}"
-        )
-        
-        for i, comp in enumerate(result.chain):
-            if isinstance(comp, Plain):
-                cleaned = comp.text
-                # Strip recall tag
-                if self.recall_tag:
-                    cleaned = cleaned.replace(self.recall_tag, "")
-                # Strip poke tag
-                if self.poke_tag:
-                    cleaned = cleaned.replace(self.poke_tag, "")
-                # Strip all reply tag variants (including malformed ones)
-                cleaned = self._reply_mgr.strip_all_reply_variants(cleaned)
-                # Clean up whitespace
-                cleaned = re.sub(r"  +", " ", cleaned).strip()
-                if cleaned != comp.text:
-                    result.chain[i] = Plain(cleaned)
-
-    # ==================== NEXT tag cleanup (fallback) ====================
-
     async def strip_next_tags_fallback(self, event: AstrMessageEvent):
         """Low-priority fallback: strip [NEXT: Xm] tags from any remaining Plain text in result chain.
 
